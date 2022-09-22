@@ -22,6 +22,7 @@ from typing import (
 if TYPE_CHECKING:
     from confighelper import ConfigHelper
     from websockets import WebRequest
+    from klippy_connection import KlippyConnection as Klippy
     Subscription = Dict[str, Optional[List[Any]]]
     _T = TypeVar("_T")
 
@@ -39,6 +40,7 @@ SENTINEL = SentinelClass.get_instance()
 class KlippyAPI(Subscribable):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
+        self.klippy: Klippy = self.server.lookup_component("klippy_connection")
         app_args = self.server.get_app_args()
         self.version = app_args.get('software_version')
         # Maintain a subscription for all moonraker requests, as
@@ -60,13 +62,13 @@ class KlippyAPI(Subscribable):
             "/printer/firmware_restart", ['POST'], self._gcode_firmware_restart)
 
     async def _gcode_pause(self, web_request: WebRequest) -> str:
-        return await self._send_klippy_request("pause_resume/pause", {})
+        return await self.pause_print()
 
     async def _gcode_resume(self, web_request: WebRequest) -> str:
-        return await self._send_klippy_request("pause_resume/resume", {})
+        return await self.resume_print()
 
     async def _gcode_cancel(self, web_request: WebRequest) -> str:
-        return await self._send_klippy_request("pause_resume/cancel", {})
+        return await self.cancel_print()
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
         filename: str = web_request.get_str('filename')
@@ -84,7 +86,7 @@ class KlippyAPI(Subscribable):
                                    default: Any = SENTINEL
                                    ) -> Any:
         try:
-            result = await self.server.make_request(
+            result = await self.klippy.request(
                 WebRequest(method, params, conn=self))
         except self.server.error:
             if isinstance(default, SentinelClass):
@@ -102,15 +104,48 @@ class KlippyAPI(Subscribable):
         return result
 
     async def start_print(self, filename: str) -> str:
+        # WARNING: Do not call this method from within the following
+        # event handlers:
+        # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
+        # Doing so will result in "wait_started" blocking for the specifed
+        # timeout (default 20s) and returning False.
         # XXX - validate that file is on disk
         if filename[0] == '/':
             filename = filename[1:]
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
+        await self.klippy.wait_started()
         return await self.run_gcode(script)
 
+    async def pause_print(
+        self, default: Union[SentinelClass, _T] = SENTINEL
+    ) -> Union[_T, str]:
+        self.server.send_event("klippy_apis:pause_requested")
+        return await self._send_klippy_request(
+            "pause_resume/pause", {}, default)
+
+    async def resume_print(
+        self, default: Union[SentinelClass, _T] = SENTINEL
+    ) -> Union[_T, str]:
+        self.server.send_event("klippy_apis:resume_requested")
+        return await self._send_klippy_request(
+            "pause_resume/resume", {}, default)
+
+    async def cancel_print(
+        self, default: Union[SentinelClass, _T] = SENTINEL
+    ) -> Union[_T, str]:
+        self.server.send_event("klippy_apis:cancel_requested")
+        return await self._send_klippy_request(
+            "pause_resume/cancel", {}, default)
+
     async def do_restart(self, gc: str) -> str:
+        # WARNING: Do not call this method from within the following
+        # event handlers:
+        # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
+        # Doing so will result in "wait_started" blocking for the specifed
+        # timeout (default 20s) and returning False.
+        await self.klippy.wait_started()
         try:
             result = await self.run_gcode(gc)
         except self.server.error as e:

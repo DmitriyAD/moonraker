@@ -7,13 +7,16 @@
 from __future__ import annotations
 import os
 import sys
+import pathlib
 import shutil
 import logging
 import json
 import tempfile
 import asyncio
+from copy import deepcopy
 from inotify_simple import INotify
 from inotify_simple import flags as iFlags
+from utils import MOONRAKER_PATH
 
 # Annotation imports
 from typing import (
@@ -30,14 +33,16 @@ from typing import (
     TypeVar,
     cast,
 )
+
 if TYPE_CHECKING:
     from inotify_simple import Event as InotifyEvent
-    from moonraker import Server
     from confighelper import ConfigHelper
     from websockets import WebRequest
     from components import database
     from components import klippy_apis
     from components import shell_command
+    from components.job_queue import JobQueue
+    StrOrPath = Union[str, pathlib.Path]
     DBComp = database.MoonrakerDatabase
     APIComp = klippy_apis.KlippyAPI
     SCMDComp = shell_command.ShellCommandFactory
@@ -54,17 +59,23 @@ class FileManager:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
+        self.reserved_paths: Dict[str, pathlib.Path] = {}
         self.full_access_roots: Set[str] = set()
         self.file_paths: Dict[str, str] = {}
+        self.add_reserved_path("moonraker", MOONRAKER_PATH)
         db: DBComp = self.server.load_component(config, "database")
+        db_path = db.get_database_path()
+        self.add_reserved_path("database", db_path)
         gc_path: str = db.get_item(
-            "moonraker", "file_manager.gcode_path", "")
-        self.gcode_metadata = MetadataStorage(self.server, gc_path, db)
+            "moonraker", "file_manager.gcode_path", "").result()
+        self.gcode_metadata = MetadataStorage(config, gc_path, db)
         self.inotify_handler = INotifyHandler(config, self,
                                               self.gcode_metadata)
         self.write_mutex = asyncio.Lock()
         self.notify_sync_lock: Optional[NotifySyncLock] = None
         self.fixed_path_args: Dict[str, Any] = {}
+        self.queue_gcodes: bool = config.getboolean('queue_gcode_uploads',
+                                                    False)
 
         # Register file management endpoints
         self.server.register_endpoint(
@@ -83,9 +94,6 @@ class FileManager:
             transports=["websocket"])
         # register client notificaitons
         self.server.register_notification("file_manager:filelist_changed")
-        # Register APIs to handle file uploads
-        self.server.register_upload_handler("/server/files/upload")
-        self.server.register_upload_handler("/api/files/local")
 
         self.server.register_event_handler(
             "server:klippy_identified", self._update_fixed_paths)
@@ -93,23 +101,19 @@ class FileManager:
         # Register Klippy Configuration Path
         config_path = config.get('config_path', None)
         if config_path is not None:
-            ret = self.register_directory('config', config_path,
-                                          full_access=True)
-            if not ret:
-                raise config.error(
-                    "Option 'config_path' is not a valid directory")
+            self.register_directory('config', config_path, full_access=True)
 
         # Register logs path
         log_path = config.get('log_path', None)
         if log_path is not None:
-            ret = self.register_directory('logs', log_path)
-            if not ret:
-                raise config.error(
-                    "Option 'log_path' is not a valid directory")
+            self.register_directory('logs', log_path)
 
         # If gcode path is in the database, register it
         if gc_path:
             self.register_directory('gcodes', gc_path, full_access=True)
+
+    async def component_init(self):
+        self.inotify_handler.initalize_roots()
 
     def _update_fixed_paths(self) -> None:
         kinfo = self.server.get_klippy_info()
@@ -127,6 +131,7 @@ class FileManager:
         # Register path for example configs
         klipper_path = paths.get('klipper_path', None)
         if klipper_path is not None:
+            self.add_reserved_path("klipper", klipper_path)
             example_cfg_path = os.path.join(klipper_path, "config")
             self.register_directory("config_examples", example_cfg_path)
             docs_path = os.path.join(klipper_path, "docs")
@@ -150,17 +155,19 @@ class FileManager:
         if os.path.islink(path):
             path = os.path.realpath(path)
         if not os.path.isdir(path) or path == "/":
-            logging.info(
-                f"\nSupplied path ({path}) for ({root}) is invalid. Make sure\n"
+            self.server.add_warning(
+                f"Supplied path ({path}) for ({root}) is invalid. Make sure\n"
                 "that the path exists and is not the file system root.")
             return False
         permissions = os.R_OK
         if full_access:
+            if not self._check_root_safe(root, path):
+                return False
             permissions |= os.W_OK
             self.full_access_roots.add(root)
         if not os.access(path, permissions):
-            logging.info(
-                f"\nMoonraker does not have permission to access path "
+            self.server.add_warning(
+                f"Moonraker does not have permission to access path "
                 f"({path}) for ({root}).")
             return False
         if path != self.file_paths.get(root, ""):
@@ -168,21 +175,85 @@ class FileManager:
             self.server.register_static_file_handler(root, path)
             if root == "gcodes":
                 db: DBComp = self.server.lookup_component("database")
-                moon_db = db.wrap_namespace("moonraker")
-                moon_db["file_manager.gcode_path"] = path
+                db.insert_item("moonraker", "file_manager.gcode_path", path)
                 # scan for metadata changes
                 self.gcode_metadata.update_gcode_path(path)
             if full_access:
                 # Refresh the file list and add watches
                 self.inotify_handler.add_root_watch(root, path)
-            else:
+            elif self.server.is_running():
                 self.event_loop.register_callback(
                     self.inotify_handler.notify_filelist_changed,
                     "root_update", root, path)
         return True
 
-    def get_sd_directory(self) -> str:
-        return self.file_paths.get('gcodes', "")
+    def _paths_overlap(self,
+                       path_one: StrOrPath,
+                       path_two: StrOrPath
+                       ) -> bool:
+        if isinstance(path_one, str):
+            path_one = pathlib.Path(path_one)
+        path_one = path_one.expanduser().resolve()
+        if isinstance(path_two, str):
+            path_two = pathlib.Path(path_two)
+        path_two = path_two.expanduser().resolve()
+        return (
+            path_one == path_two or
+            path_one in path_two.parents or
+            path_two in path_one.parents
+        )
+
+    def _check_root_safe(self, new_root: str, new_path: StrOrPath) -> bool:
+        # Make sure that registered full access paths
+        # do no overlap one another, nor a reserved path
+        if isinstance(new_path, str):
+            new_path = pathlib.Path(new_path)
+        new_path = new_path.expanduser().resolve()
+        for reg_root, reg_path in self.file_paths.items():
+            exp_reg_path = pathlib.Path(reg_path).expanduser().resolve()
+            if (
+                reg_root not in self.full_access_roots or
+                (reg_root == new_root and new_path == exp_reg_path)
+            ):
+                continue
+            if self._paths_overlap(new_path, exp_reg_path):
+                self.server.add_warning(
+                    f"Failed to register '{new_root}': '{new_path}', path "
+                    f"overlaps registered root '{reg_root}': '{exp_reg_path}'")
+                return False
+        for res_name, res_path in self.reserved_paths.items():
+            if self._paths_overlap(new_path, res_path):
+                self.server.add_warning(
+                    f"Failed to register '{new_root}': '{new_path}', path "
+                    f"overlaps reserved path '{res_name}': '{res_path}'")
+                return False
+        return True
+
+    def add_reserved_path(self, name: str, res_path: StrOrPath) -> bool:
+        if isinstance(res_path, str):
+            res_path = pathlib.Path(res_path)
+        res_path = res_path.expanduser().resolve()
+        if (
+            name in self.reserved_paths and
+            res_path == self.reserved_paths[name]
+        ):
+            return True
+        self.reserved_paths[name] = res_path
+        check_passed = True
+        for reg_root, reg_path in list(self.file_paths.items()):
+            if reg_root not in self.full_access_roots:
+                continue
+            exp_reg_path = pathlib.Path(reg_path).expanduser().resolve()
+            if self._paths_overlap(res_path, exp_reg_path):
+                self.server.add_warning(
+                    f"Full access root '{reg_root}' overlaps reserved path "
+                    f"'{name}', removing access")
+                self.file_paths.pop(reg_root, None)
+                check_passed = False
+        return check_passed
+
+    def get_directory(self, root: str = "gcodes") -> str:
+        return self.file_paths.get(root, "")
 
     def get_registered_dirs(self) -> List[str]:
         return list(self.file_paths.keys())
@@ -196,10 +267,26 @@ class FileManager:
             return ""
         return os.path.relpath(full_path, start=root_dir)
 
+    def get_metadata_storage(self) -> MetadataStorage:
+        return self.gcode_metadata
+
     def check_file_exists(self, root: str, filename: str) -> bool:
         root_dir = self.file_paths.get(root, "")
         file_path = os.path.join(root_dir, filename)
         return os.path.exists(file_path)
+
+    def can_access_path(self, path: StrOrPath) -> bool:
+        if isinstance(path, str):
+            path = pathlib.Path(path)
+        path = path.expanduser().resolve()
+        for registered in self.file_paths.values():
+            reg_root_path = pathlib.Path(registered).resolve()
+            if reg_root_path in path.parents:
+                return True
+        return False
+
+    def upload_queue_enabled(self) -> bool:
+        return self.queue_gcodes
 
     def sync_inotify_event(self, path: str) -> Optional[NotifySyncLock]:
         if self.notify_sync_lock is None or \
@@ -287,21 +374,21 @@ class FileManager:
         # Get virtual_sdcard status
         kapis: APIComp = self.server.lookup_component('klippy_apis')
         result: Dict[str, Any]
-        result = await kapis.query_objects({'print_stats': None})
+        result = await kapis.query_objects({'print_stats': None}, {})
         pstats = result.get('print_stats', {})
         loaded_file: str = pstats.get('filename', "")
         state: str = pstats.get('state', "")
         gc_path = self.file_paths.get('gcodes', "")
         full_path = os.path.join(gc_path, loaded_file)
-        if loaded_file and state != "complete":
+        is_printing = state in ["printing", "paused"]
+        if loaded_file and is_printing:
             if os.path.isdir(requested_path):
                 # Check to see of the loaded file is in the request
                 if full_path.startswith(requested_path):
                     raise self.server.error("File currently in use", 403)
             elif full_path == requested_path:
                 raise self.server.error("File currently in use", 403)
-        ongoing = state in ["printing", "paused"]
-        return ongoing
+        return not is_printing
 
     def _convert_request_path(self, request_path: str) -> Tuple[str, str]:
         # Parse the root, relative path, and disk path from a remote request
@@ -504,35 +591,37 @@ class FileManager:
     async def _finish_gcode_upload(self,
                                    upload_info: Dict[str, Any]
                                    ) -> Dict[str, Any]:
-        print_ongoing: bool = False
-        start_print: bool = upload_info['start_print']
         # Verify that the operation can be done if attempting to upload a gcode
+        can_start: bool = False
         try:
             check_path: str = upload_info['dest_path']
-            print_ongoing = await self._handle_operation_check(
-                check_path)
+            can_start = await self._handle_operation_check(check_path)
         except self.server.error as e:
             if e.status_code == 403:
                 raise self.server.error(
                     "File is loaded, upload not permitted", 403)
-            else:
-                # Couldn't reach Klippy, so it should be safe
-                # to permit the upload but not start
-                start_print = False
-        # Don't start if another print is currently in progress
-        start_print = start_print and not print_ongoing
         self.notify_sync_lock = NotifySyncLock(upload_info['dest_path'])
         finfo = await self._process_uploaded_file(upload_info)
         await self.gcode_metadata.parse_metadata(
             upload_info['filename'], finfo).wait()
-        if start_print:
-            # Make a Klippy Request to "Start Print"
-            kapis: APIComp = self.server.lookup_component('klippy_apis')
-            try:
-                await kapis.start_print(upload_info['filename'])
-            except self.server.error:
-                # Attempt to start print failed
-                start_print = False
+        started: bool = False
+        queued: bool = False
+        if upload_info['start_print']:
+            if can_start:
+                kapis: APIComp = self.server.lookup_component('klippy_apis')
+                try:
+                    await kapis.start_print(upload_info['filename'])
+                except self.server.error:
+                    # Attempt to start print failed
+                    pass
+                else:
+                    started = True
+            if self.queue_gcodes and not started:
+                job_queue: JobQueue = self.server.lookup_component('job_queue')
+                await job_queue.queue_job(
+                    upload_info['filename'], check_exists=False)
+                queued = True
+
         await self.notify_sync_lock.wait(300.)
         self.notify_sync_lock = None
         return {
@@ -540,7 +629,8 @@ class FileManager:
                 'path': upload_info['filename'],
                 'root': "gcodes"
             },
-            'print_started': start_print,
+            'print_started': started,
+            'print_queued': queued,
             'action': "create_file"
         }
 
@@ -726,6 +816,7 @@ class InotifyNode:
         self.pending_node_events: Dict[str, asyncio.Handle] = {}
         self.pending_deleted_children: Set[Tuple[str, bool]] = set()
         self.pending_file_events: Dict[str, str] = {}
+        self.is_processing_metadata = False
 
     async def _finish_create_node(self) -> None:
         # Finish a node's creation.  All children that were created
@@ -738,10 +829,12 @@ class InotifyNode:
         node_path = self.get_path()
         root = self.get_root()
         # Scan child nodes for unwatched directories and metadata
+        self.is_processing_metadata = True
         mevts: List[asyncio.Event] = self.scan_node()
         if mevts:
             mfuts = [e.wait() for e in mevts]
             await asyncio.gather(*mfuts)
+        self.is_processing_metadata = False
         self.ihdlr.log_nodes()
         self.ihdlr.notify_filelist_changed(
             "create_dir", root, node_path)
@@ -789,6 +882,7 @@ class InotifyNode:
                               new_name: str,
                               new_parent: InotifyNode
                               ) -> None:
+        self.flush_delete()
         child_node = self.pop_child_node(child_name)
         if child_node is None:
             logging.info(f"No child for node at path: {self.get_path()}")
@@ -822,9 +916,14 @@ class InotifyNode:
         self.pending_file_events[file_name] = evt_name
 
     async def complete_file_write(self, file_name: str) -> None:
+        self.flush_delete()
         evt_name = self.pending_file_events.pop(file_name, None)
         if evt_name is None:
             logging.info(f"Invalid file write event: {file_name}")
+            return
+        if self.is_processing():
+            logging.debug("Metadata is processing, suppressing write "
+                          f"event: {file_name}")
             return
         pending_node = self.search_pending_event("create_node")
         if pending_node is not None:
@@ -856,6 +955,7 @@ class InotifyNode:
                           name: str,
                           notify: bool = True
                           ) -> InotifyNode:
+        self.flush_delete()
         if name in self.child_nodes:
             return self.child_nodes[name]
         new_child = InotifyNode(self.ihdlr, self, name)
@@ -892,6 +992,11 @@ class InotifyNode:
     def get_root(self) -> str:
         return self.parent_node.get_root()
 
+    def is_processing(self) -> bool:
+        if self.is_processing_metadata:
+            return True
+        return self.parent_node.is_processing()
+
     def add_event(self, evt_name: str, timeout: float) -> None:
         if evt_name in self.pending_node_events:
             self.reset_event(evt_name, timeout)
@@ -917,6 +1022,13 @@ class InotifyNode:
         hdl = self.pending_node_events.pop(evt_name, None)
         if hdl is not None:
             hdl.cancel()
+
+    def flush_delete(self):
+        if 'delete_child' not in self.pending_node_events:
+            return
+        hdl = self.pending_node_events['delete_child']
+        hdl.cancel()
+        self._finish_delete_child()
 
     def clear_events(self, include_children: bool = True) -> None:
         if include_children:
@@ -953,6 +1065,9 @@ class InotifyRootNode(InotifyNode):
             return self
         return None
 
+    def is_processing(self) -> bool:
+        return self.is_processing_metadata
+
 class NotifySyncLock:
     def __init__(self, dest_path: str) -> None:
         self.wait_fut: Optional[asyncio.Future] = None
@@ -988,7 +1103,11 @@ class NotifySyncLock:
         if not self.check_need_sync(path):
             return
         self.notified_paths.add(path)
-        if self.wait_fut is not None and self.dest_path == path:
+        if (
+            self.wait_fut is not None and
+            not self.wait_fut.done() and
+            self.dest_path == path
+        ):
             self.wait_fut.set_result(None)
         # Transfer control to waiter
         try:
@@ -1031,7 +1150,8 @@ class INotifyHandler:
         self.watched_nodes: Dict[int, InotifyNode] = {}
         self.pending_moves: Dict[
             int, Tuple[InotifyNode, str, asyncio.Handle]] = {}
-
+        self.create_gcode_notifications: Dict[str, Any] = {}
+        self.initialized: bool = False
 
     def add_root_watch(self, root: str, root_path: str) -> None:
         # remove all exisiting watches on root
@@ -1041,10 +1161,23 @@ class INotifyHandler:
             old_root.clear_events()
         root_node = InotifyRootNode(self, root, root_path)
         self.watched_roots[root] = root_node
-        mevts = root_node.scan_node()
-        self.log_nodes()
-        self.event_loop.register_callback(
-            self._notify_root_updated, mevts, root, root_path)
+        if self.initialized:
+            mevts = root_node.scan_node()
+            self.log_nodes()
+            self.event_loop.register_callback(
+                self._notify_root_updated, mevts, root, root_path)
+
+    def initalize_roots(self):
+        for root, node in self.watched_roots.items():
+            evts = node.scan_node()
+            if not evts:
+                continue
+            root_path = node.get_path()
+            self.event_loop.register_callback(
+                self._notify_root_updated, evts, root, root_path)
+        if self.watched_roots:
+            self.log_nodes()
+        self.initialized = True
 
     async def _notify_root_updated(self,
                                    mevts: List[asyncio.Event],
@@ -1054,7 +1187,9 @@ class INotifyHandler:
         if mevts:
             mfuts = [e.wait() for e in mevts]
             await asyncio.gather(*mfuts)
-        self.notify_filelist_changed("root_update", root, root_path)
+        cur_path = self.watched_roots[root].get_path()
+        if self.server.is_running() and cur_path == root_path:
+            self.notify_filelist_changed("root_update", root, root_path)
 
     def add_watch(self, node: InotifyNode) -> int:
         dir_path = node.get_path()
@@ -1104,10 +1239,10 @@ class INotifyHandler:
                 new_rel_path = self.file_manager.get_relative_path(
                     "gcodes", new_path)
                 if is_dir:
-                    self.gcode_metadata.move_directory_metadata(
+                    await self.gcode_metadata.move_directory_metadata(
                         prev_rel_path, new_rel_path)
                 else:
-                    return self.gcode_metadata.move_file_metadata(
+                    return await self.gcode_metadata.move_file_metadata(
                         prev_rel_path, new_rel_path)
             else:
                 # move from a non-gcodes root to gcodes root needs a rescan
@@ -1130,15 +1265,18 @@ class INotifyHandler:
 
     def parse_gcode_metadata(self, file_path: str) -> asyncio.Event:
         rel_path = self.file_manager.get_relative_path("gcodes", file_path)
+        ext = os.path.splitext(rel_path)[-1].lower()
         try:
             path_info = self.file_manager.get_path_info(file_path, "gcodes")
         except Exception:
-            logging.exception(
-                f"Error retreiving path info for file {file_path}")
+            path_info = {}
+        if (
+            ext not in VALID_GCODE_EXTS or
+            path_info.get('size', 0) == 0
+        ):
             evt = asyncio.Event()
             evt.set()
             return evt
-        ext = os.path.splitext(file_path)[-1].lower()
         if ext == ".ufp":
             rel_path = os.path.splitext(rel_path)[0] + ".gcode"
             path_info['ufp_path'] = file_path
@@ -1265,7 +1403,10 @@ class INotifyHandler:
         elif evt.mask & iFlags.MOVED_TO:
             logging.debug(f"Inotify file move to: {root}, "
                           f"{node_path}, {evt.name}")
+            node.flush_delete()
             moved_evt = self.pending_moves.pop(evt.cookie, None)
+            # Don't emit file events if the node is processing metadata
+            can_notify = not node.is_processing()
             if moved_evt is not None:
                 # Moved from a currently watched directory
                 prev_parent, prev_name, hdl = moved_evt
@@ -1278,15 +1419,20 @@ class INotifyHandler:
                     # Unable to move, metadata needs parsing
                     mevt = self.parse_gcode_metadata(file_path)
                     await mevt.wait()
-                self.notify_filelist_changed(
-                    "move_file", root, file_path,
-                    prev_root, prev_path)
+                if can_notify:
+                    self.notify_filelist_changed(
+                        "move_file", root, file_path,
+                        prev_root, prev_path)
             else:
                 if root == "gcodes":
                     mevt = self.parse_gcode_metadata(file_path)
                     await mevt.wait()
-                self.notify_filelist_changed(
-                    "create_file", root, file_path)
+                if can_notify:
+                    self.notify_filelist_changed(
+                        "create_file", root, file_path)
+            if not can_notify:
+                logging.debug("Metadata is processing, suppressing move "
+                              f"notification: {file_path}")
         elif evt.mask & iFlags.MODIFY:
             node.schedule_file_event(evt.name, "modify_file")
         elif evt.mask & iFlags.CLOSE_WRITE:
@@ -1311,6 +1457,22 @@ class INotifyHandler:
                 is_valid = False
         elif action not in ["delete_file", "delete_dir"]:
             is_valid = False
+        ext = os.path.splitext(rel_path)[-1].lower()
+        if (
+            is_valid and
+            root == "gcodes" and
+            ext in VALID_GCODE_EXTS and
+            action == "create_file"
+        ):
+            prev_info = self.create_gcode_notifications.get(rel_path, {})
+            if file_info == prev_info:
+                logging.debug("Ignoring duplicate 'create_file' "
+                              f"notification: {rel_path}")
+                is_valid = False
+            else:
+                self.create_gcode_notifications[rel_path] = dict(file_info)
+        elif rel_path in self.create_gcode_notifications:
+            del self.create_gcode_notifications[rel_path]
         file_info['path'] = rel_path
         file_info['root'] = root
         result = {'action': action, 'item': file_info}
@@ -1351,39 +1513,65 @@ METADATA_VERSION = 3
 
 class MetadataStorage:
     def __init__(self,
-                 server: Server,
+                 config: ConfigHelper,
                  gc_path: str,
                  db: DBComp
                  ) -> None:
-        self.server = server
+        self.server = config.get_server()
+        self.enable_object_proc = config.getboolean(
+            'enable_object_processing', False)
         self.gc_path = gc_path
         db.register_local_namespace(METADATA_NAMESPACE)
         self.mddb = db.wrap_namespace(
             METADATA_NAMESPACE, parse_keys=False)
         version = db.get_item(
-            "moonraker", "file_manager.metadata_version", 0)
+            "moonraker", "file_manager.metadata_version", 0).result()
         if version != METADATA_VERSION:
             # Clear existing metadata when version is bumped
-            for fname in self.mddb.keys():
-                self.remove_file_metadata(fname)
+            self.mddb.clear()
             db.insert_item(
                 "moonraker", "file_manager.metadata_version",
                 METADATA_VERSION)
+        # Keep a local cache of the metadata.  This allows for synchronous
+        # queries.  Metadata is generally under 1KiB per entry, so even at
+        # 1000 gcode files we are using < 1MiB of additional memory.
+        # That said, in the future all components that access metadata should
+        # be refactored to do so asynchronously.
+        self.metadata: Dict[str, Any] = self.mddb.as_dict()
         self.pending_requests: Dict[
             str, Tuple[Dict[str, Any], asyncio.Event]] = {}
         self.busy: bool = False
+
+        # Check for removed gcode files while moonraker was shutdown
         if self.gc_path:
-            # Check for removed gcode files while moonraker was shutdown
-            for fname in list(self.mddb.keys()):
+            del_keys: List[str] = []
+            for fname in list(self.metadata.keys()):
                 fpath = os.path.join(self.gc_path, fname)
                 if not os.path.isfile(fpath):
-                    self.remove_file_metadata(fname)
-                    logging.info(f"Pruned file: {fname}")
-                    continue
+                    del self.metadata[fname]
+                    del_keys.append(fname)
+                elif "thumbnails" in self.metadata[fname]:
+                    # Check for any stale data entries and remove them
+                    need_sync = False
+                    for thumb in self.metadata[fname]['thumbnails']:
+                        if 'data' in thumb:
+                            del thumb['data']
+                            need_sync = True
+                    if need_sync:
+                        self.mddb[fname] = self.metadata[fname]
+            # Delete any removed keys from the database
+            if del_keys:
+                ret = self.mddb.delete_batch(del_keys).result()
+                self._remove_thumbs(ret)
+                pruned = '\n'.join(ret.keys())
+                if pruned:
+                    logging.info(f"Pruned metadata for the following:\n"
+                                 f"{pruned}")
 
     def update_gcode_path(self, path: str) -> None:
         if path == self.gc_path:
             return
+        self.metadata.clear()
         self.mddb.clear()
         self.gc_path = path
 
@@ -1391,10 +1579,12 @@ class MetadataStorage:
             key: str,
             default: _T = None
             ) -> Union[_T, Dict[str, Any]]:
-        return self.mddb.get(key, default)
+        return deepcopy(self.metadata.get(key, default))
 
-    def __getitem__(self, key: str) -> Dict[str, Any]:
-        return self.mddb[key]
+    def insert(self, key: str, value: Dict[str, Any]) -> None:
+        val = deepcopy(value)
+        self.metadata[key] = val
+        self.mddb[key] = val
 
     def _has_valid_data(self,
                         fname: str,
@@ -1404,7 +1594,7 @@ class MetadataStorage:
             # UFP files always need processing
             return False
         mdata: Dict[str, Any]
-        mdata = self.mddb.get(fname, {'size': "", 'modified': 0})
+        mdata = self.metadata.get(fname, {'size': "", 'modified': 0})
         for field in ['size', 'modified']:
             if mdata[field] != path_info.get(field, None):
                 return False
@@ -1413,78 +1603,126 @@ class MetadataStorage:
     def remove_directory_metadata(self, dir_name: str) -> None:
         if dir_name[-1] != "/":
             dir_name += "/"
-        for fname in list(self.mddb.keys()):
+        del_items: Dict[str, Any] = {}
+        for fname in list(self.metadata.keys()):
             if fname.startswith(dir_name):
-                self.remove_file_metadata(fname)
+                md = self.metadata.pop(fname, None)
+                if md:
+                    del_items[fname] = md
+        if del_items:
+            # Remove items from persistent storage
+            self.mddb.delete_batch(list(del_items.keys()))
+            eventloop = self.server.get_event_loop()
+            # Remove thumbs in a nother thread
+            eventloop.run_in_thread(self._remove_thumbs, del_items)
 
     def remove_file_metadata(self, fname: str) -> None:
-        metadata: Optional[Dict[str, Any]]
-        metadata = self.mddb.pop(fname, None)
-        if metadata is None:
+        md: Optional[Dict[str, Any]] = self.metadata.pop(fname, None)
+        if md is None:
             return
-        # Delete associated thumbnails
-        fdir = os.path.dirname(os.path.join(self.gc_path, fname))
-        if "thumbnails" in metadata:
-            thumb: Dict[str, Any]
-            for thumb in metadata["thumbnails"]:
-                path: Optional[str] = thumb.get("relative_path", None)
-                if path is None:
-                    continue
-                thumb_path = os.path.join(fdir, path)
-                if not os.path.isfile(thumb_path):
-                    continue
-                try:
-                    os.remove(thumb_path)
-                except Exception:
-                    logging.debug(f"Error removing thumb at {thumb_path}")
+        self.mddb.pop(fname, None)
+        eventloop = self.server.get_event_loop()
+        eventloop.run_in_thread(self._remove_thumbs, {fname: md})
 
-    def move_directory_metadata(self, prev_dir: str, new_dir: str) -> None:
+    def _remove_thumbs(self, records: Dict[str, Dict[str, Any]]) -> None:
+        for fname, metadata in records.items():
+            # Delete associated thumbnails
+            fdir = os.path.dirname(os.path.join(self.gc_path, fname))
+            if "thumbnails" in metadata:
+                thumb: Dict[str, Any]
+                for thumb in metadata["thumbnails"]:
+                    path: Optional[str] = thumb.get("relative_path", None)
+                    if path is None:
+                        continue
+                    thumb_path = os.path.join(fdir, path)
+                    if not os.path.isfile(thumb_path):
+                        continue
+                    try:
+                        os.remove(thumb_path)
+                    except Exception:
+                        logging.debug(f"Error removing thumb at {thumb_path}")
+
+    async def move_directory_metadata(self,
+                                      prev_dir: str,
+                                      new_dir: str
+                                      ) -> None:
         if prev_dir[-1] != "/":
             prev_dir += "/"
-        for prev_fname in list(self.mddb.keys()):
+        moved: List[Tuple[str, str, Dict[str, Any]]] = []
+        for prev_fname in list(self.metadata.keys()):
             if prev_fname.startswith(prev_dir):
                 new_fname = os.path.join(new_dir, prev_fname[len(prev_dir):])
-                self.move_file_metadata(prev_fname, new_fname, False)
+                md: Optional[Dict[str, Any]]
+                md = self.metadata.pop(prev_fname, None)
+                if md is None:
+                    continue
+                self.metadata[new_fname] = md
+                moved.append((prev_fname, new_fname, md))
+        if moved:
+            source = [m[0] for m in moved]
+            dest = [m[1] for m in moved]
+            self.mddb.move_batch(source, dest)
+            eventloop = self.server.get_event_loop()
+            await eventloop.run_in_thread(self._move_thumbnails, moved)
 
-    def move_file_metadata(self,
-                           prev_fname: str,
-                           new_fname: str,
-                           move_thumbs: bool = True
-                           ) -> bool:
+    async def move_file_metadata(self,
+                                 prev_fname: str,
+                                 new_fname: str,
+                                 move_thumbs: bool = True
+                                 ) -> bool:
         metadata: Optional[Dict[str, Any]]
-        metadata = self.mddb.pop(prev_fname, None)
+        metadata = self.metadata.pop(prev_fname, None)
         if metadata is None:
+            # If this move overwrites an existing file it is necessary
+            # to rescan which requires that we remove any existing
+            # metadata.
+            if self.metadata.pop(new_fname, None) is not None:
+                self.mddb.pop(new_fname, None)
             return False
-        self.mddb[new_fname] = metadata
-        prev_dir = os.path.dirname(os.path.join(self.gc_path, prev_fname))
-        new_dir = os.path.dirname(os.path.join(self.gc_path, new_fname))
-        if "thumbnails" in metadata and move_thumbs:
-            thumb: Dict[str, Any]
-            for thumb in metadata["thumbnails"]:
-                path: Optional[str] = thumb.get("relative_path", None)
-                if path is None:
-                    continue
-                thumb_path = os.path.join(prev_dir, path)
-                if not os.path.isfile(thumb_path):
-                    continue
-                new_path = os.path.join(new_dir, path)
-                try:
-                    os.makedirs(os.path.dirname(new_path), exist_ok=True)
-                    shutil.move(thumb_path, new_path)
-                except Exception:
-                    logging.debug(f"Error moving thumb from {thumb_path}"
-                                  f" to {new_path}")
+        self.metadata[new_fname] = metadata
+        self.mddb.move_batch([prev_fname], [new_fname])
+        if move_thumbs:
+            eventloop = self.server.get_event_loop()
+            await eventloop.run_in_thread(
+                self._move_thumbnails,
+                [(prev_fname, new_fname, metadata)])
         return True
+
+    def _move_thumbnails(self,
+                         records: List[Tuple[str, str, Dict[str, Any]]]
+                         ) -> None:
+        for (prev_fname, new_fname, metadata) in records:
+            prev_dir = os.path.dirname(os.path.join(self.gc_path, prev_fname))
+            new_dir = os.path.dirname(os.path.join(self.gc_path, new_fname))
+            if "thumbnails" in metadata:
+                thumb: Dict[str, Any]
+                for thumb in metadata["thumbnails"]:
+                    path: Optional[str] = thumb.get("relative_path", None)
+                    if path is None:
+                        continue
+                    thumb_path = os.path.join(prev_dir, path)
+                    if not os.path.isfile(thumb_path):
+                        continue
+                    new_path = os.path.join(new_dir, path)
+                    try:
+                        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                        shutil.move(thumb_path, new_path)
+                    except Exception:
+                        logging.debug(f"Error moving thumb from {thumb_path}"
+                                      f" to {new_path}")
 
     def parse_metadata(self,
                        fname: str,
                        path_info: Dict[str, Any]
                        ) -> asyncio.Event:
+        if fname in self.pending_requests:
+            return self.pending_requests[fname][1]
         mevt = asyncio.Event()
         ext = os.path.splitext(fname)[1]
-        if fname in self.pending_requests or \
-                ext not in VALID_GCODE_EXTS or \
-                self._has_valid_data(fname, path_info):
+        if (
+            ext not in VALID_GCODE_EXTS or
+            self._has_valid_data(fname, path_info)
+        ):
             # request already pending or not necessary
             mevt.set()
             return mevt
@@ -1499,7 +1737,7 @@ class MetadataStorage:
     async def _process_metadata_update(self) -> None:
         while self.pending_requests:
             fname, (path_info, mevt) = \
-                self.pending_requests.popitem()
+                list(self.pending_requests.items())[0]
             if self._has_valid_data(fname, path_info):
                 mevt.set()
                 continue
@@ -1515,14 +1753,16 @@ class MetadataStorage:
                     break
             else:
                 if ufp_path is None:
-                    self.mddb[fname] = {
+                    self.metadata[fname] = {
                         'size': path_info.get('size', 0),
                         'modified': path_info.get('modified', 0),
                         'print_start_time': None,
                         'job_id': None
                     }
+                    self.mddb[fname] = self.metadata[fname]
                 logging.info(
                     f"Unable to extract medatadata from file: {fname}")
+            self.pending_requests.pop(fname, None)
             mevt.set()
         self.busy = False
 
@@ -1540,6 +1780,9 @@ class MetadataStorage:
             timeout = 300.
             ufp_path.replace("\"", "\\\"")
             cmd += f" -u \"{ufp_path}\""
+        if self.enable_object_proc:
+            timeout = 300.
+            cmd += " --check-objects"
         shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
         scmd = shell_cmd.build_shell_command(cmd, log_stderr=True)
         result = await scmd.run_with_response(timeout=timeout)
@@ -1554,8 +1797,8 @@ class MetadataStorage:
             # This indicates an error, do not add metadata for this
             raise self.server.error("Unable to extract metadata")
         metadata.update({'print_start_time': None, 'job_id': None})
-        self.mddb[path] = dict(metadata)
-        metadata['filename'] = path
+        self.metadata[path] = metadata
+        self.mddb[path] = metadata
 
 def load_component(config: ConfigHelper) -> FileManager:
     return FileManager(config)

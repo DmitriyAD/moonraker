@@ -9,14 +9,13 @@ import asyncio
 import os
 import pathlib
 import logging
-import json
-import sys
 import shutil
 import zipfile
 import time
 import tempfile
-from tornado.ioloop import PeriodicCallback
-from tornado.httpclient import AsyncHTTPClient
+import re
+from thirdparty.packagekit import enums as PkEnum
+from . import base_config
 from .base_deploy import BaseDeploy
 from .app_deploy import AppDeploy
 from .git_deploy import GitDeploy
@@ -26,39 +25,36 @@ from .zip_deploy import ZipDeploy
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Optional,
+    Set,
     Tuple,
     Type,
     Union,
     Dict,
     List,
+    cast
 )
 if TYPE_CHECKING:
-    from tornado.httpclient import HTTPResponse
     from moonraker import Server
     from confighelper import ConfigHelper
     from websockets import WebRequest
-    from components import klippy_apis
-    from components import shell_command
-    from components import database
-    APIComp = klippy_apis.KlippyAPI
-    SCMDComp = shell_command.ShellCommandFactory
-    DBComp = database.MoonrakerDatabase
+    from components.klippy_apis import KlippyAPI as APIComp
+    from components.shell_command import ShellCommandFactory as SCMDComp
+    from components.database import MoonrakerDatabase as DBComp
+    from components.database import NamespaceWrapper
+    from components.dbus_manager import DbusManager
+    from components.machine import Machine
+    from components.http_client import HttpClient
+    from eventloop import FlexTimer
+    from dbus_next import Variant
+    from dbus_next.aio import ProxyInterface
     JsonType = Union[List[Any], Dict[str, Any]]
 
-MOONRAKER_PATH = os.path.normpath(os.path.join(
-    os.path.dirname(__file__), "../../.."))
-SUPPLEMENTAL_CFG_PATH = os.path.join(
-    os.path.dirname(__file__), "update_manager.conf")
-KLIPPER_DEFAULT_PATH = os.path.expanduser("~/klipper")
-KLIPPER_DEFAULT_EXEC = os.path.expanduser("~/klippy-env/bin/python")
-
 # Check To see if Updates are necessary each hour
-UPDATE_REFRESH_INTERVAL_MS = 3600000
-# Perform auto refresh no sooner than 12 hours apart
-MIN_REFRESH_TIME = 43200
+UPDATE_REFRESH_INTERVAL = 3600.
 # Perform auto refresh no later than 4am
-MAX_PKG_UPDATE_HOUR = 4
+MAX_UPDATE_HOUR = 4
 
 def get_deploy_class(app_path: str) -> Type:
     if AppDeploy._is_git_repo(app_path):
@@ -70,39 +66,30 @@ class UpdateManager:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
-        self.app_config = config.read_supplemental_config(
-            SUPPLEMENTAL_CFG_PATH)
-        auto_refresh_enabled = config.getboolean('enable_auto_refresh', False)
         self.channel = config.get('channel', "dev")
         if self.channel not in ["dev", "beta"]:
             raise config.error(
                 f"Unsupported channel '{self.channel}' in section"
                 " [update_manager]")
+        self.app_config = base_config.get_base_configuration(
+            config, self.channel
+        )
+        auto_refresh_enabled = config.getboolean('enable_auto_refresh', False)
         self.cmd_helper = CommandHelper(config)
         self.updaters: Dict[str, BaseDeploy] = {}
         if config.getboolean('enable_system_updates', True):
             self.updaters['system'] = PackageDeploy(config, self.cmd_helper)
+        mcfg = self.app_config["moonraker"]
+        kcfg = self.app_config["klipper"]
+        mclass = get_deploy_class(mcfg.get("path"))
+        self.updaters['moonraker'] = mclass(mcfg, self.cmd_helper)
+        kclass = BaseDeploy
         if (
-            os.path.exists(KLIPPER_DEFAULT_PATH) and
-            os.path.exists(KLIPPER_DEFAULT_EXEC)
+            os.path.exists(kcfg.get("path")) and
+            os.path.exists(kcfg.get("env"))
         ):
-            self.updaters['klipper'] = get_deploy_class(KLIPPER_DEFAULT_PATH)(
-                self.app_config[f"update_manager klipper"], self.cmd_helper,
-                {
-                    'channel': self.channel,
-                    'path': KLIPPER_DEFAULT_PATH,
-                    'executable': KLIPPER_DEFAULT_EXEC
-                })
-        else:
-            self.updaters['klipper'] = BaseDeploy(
-                self.app_config[f"update_manager klipper"], self.cmd_helper)
-        self.updaters['moonraker'] = get_deploy_class(MOONRAKER_PATH)(
-            self.app_config[f"update_manager moonraker"], self.cmd_helper,
-            {
-                'channel': self.channel,
-                'path': MOONRAKER_PATH,
-                'executable': sys.executable
-            })
+            kclass = get_deploy_class(kcfg.get("path"))
+        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
 
         # TODO: The below check may be removed when invalid config options
         # raise a config error.
@@ -119,29 +106,35 @@ class UpdateManager:
             cfg = config[section]
             name = section.split()[-1]
             if name in self.updaters:
-                raise config.error(f"Client repo {name} already added")
-            client_type = cfg.get("type")
-            if client_type in ["web", "web_beta"]:
-                self.updaters[name] = WebClientDeploy(cfg, self.cmd_helper)
-            elif client_type in ["git_repo", "zip", "zip_beta"]:
-                path = os.path.expanduser(cfg.get('path'))
-                self.updaters[name] = get_deploy_class(path)(
-                    cfg, self.cmd_helper)
-            else:
-                raise config.error(
-                    f"Invalid type '{client_type}' for section [{section}]")
+                self.server.add_warning(
+                    f"[update_manager]: Extension {name} already added"
+                )
+                continue
+            try:
+                client_type = cfg.get("type")
+                if client_type in ["web", "web_beta"]:
+                    self.updaters[name] = WebClientDeploy(cfg, self.cmd_helper)
+                elif client_type in ["git_repo", "zip", "zip_beta"]:
+                    path = os.path.expanduser(cfg.get('path'))
+                    dclass = get_deploy_class(path)
+                    self.updaters[name] = dclass(cfg, self.cmd_helper)
+                else:
+                    self.server.add_warning(
+                        f"Invalid type '{client_type}' for section [{section}]")
+            except Exception as e:
+                self.server.add_warning(
+                    f"[update_manager]: Failed to load extension {name}: {e}"
+                )
 
         self.cmd_request_lock = asyncio.Lock()
-        self.initialized_lock = asyncio.Event()
+        self.initial_refresh_complete: bool = False
         self.klippy_identified_evt: Optional[asyncio.Event] = None
 
         # Auto Status Refresh
-        self.last_refresh_time: float = 0
-        self.refresh_cb: Optional[PeriodicCallback] = None
+        self.refresh_timer: Optional[FlexTimer] = None
         if auto_refresh_enabled:
-            self.refresh_cb = PeriodicCallback(
-                self._handle_auto_refresh,  # type: ignore
-                UPDATE_REFRESH_INTERVAL_MS)
+            self.refresh_timer = self.event_loop.register_timer(
+                self._handle_auto_refresh)
 
         self.server.register_endpoint(
             "/machine/update/moonraker", ["POST"],
@@ -170,26 +163,25 @@ class UpdateManager:
         # Register Ready Event
         self.server.register_event_handler(
             "server:klippy_identified", self._set_klipper_repo)
-        # Initialize GitHub API Rate Limits and configured updaters
-        self.event_loop.register_callback(
-            self._initalize_updaters, list(self.updaters.values()))
 
-    async def _initalize_updaters(self,
-                                  initial_updaters: List[BaseDeploy]
-                                  ) -> None:
-        async with self.cmd_request_lock:
-            await self.cmd_helper.init_api_rate_limit()
-            for updater in initial_updaters:
-                if isinstance(updater, PackageDeploy):
-                    ret = updater.refresh(False)
-                else:
-                    ret = updater.refresh()
-                await ret
-        self.initialized_lock.set()
-        if self.refresh_cb is not None:
-            self.refresh_cb.start()
+    async def component_init(self) -> None:
+        # Prune stale data from the database
+        umdb = self.cmd_helper.get_umdb()
+        db_keys = await umdb.keys()
+        for key in db_keys:
+            if key not in self.updaters:
+                logging.info(f"Removing stale update_manager data: {key}")
+                await umdb.pop(key, None)
+        for updater in list(self.updaters.values()):
+            await updater.initialize()
+        if self.refresh_timer is not None:
+            self.refresh_timer.start()
+        else:
+            self.event_loop.register_callback(
+                self._handle_auto_refresh, self.event_loop.get_loop_time()
+            )
 
-    async def _set_klipper_repo(self) -> None:
+    def _set_klipper_repo(self) -> None:
         if self.klippy_identified_evt is not None:
             self.klippy_identified_evt.set()
         kinfo = self.server.get_klippy_info()
@@ -205,17 +197,26 @@ class UpdateManager:
         ):
             # Current Klipper Updater is valid
             return
+        # Update paths in the database
+        db: DBComp = self.server.lookup_component('database')
+        db.insert_item("moonraker", "update_manager.klipper_path", kpath)
+        db.insert_item("moonraker", "update_manager.klipper_exec", executable)
+        kcfg = self.app_config["klipper"]
+        kcfg.set_option("path", kpath)
+        kcfg.set_option("env", executable)
         need_notification = not isinstance(kupdater, AppDeploy)
-        self.updaters['klipper'] = get_deploy_class(kpath)(
-            self.app_config[f"update_manager klipper"], self.cmd_helper,
-            {
-                'channel': self.channel,
-                'path': kpath,
-                'executable': executable
-            })
+        kclass = get_deploy_class(kpath)
+        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
+        coro = self._update_klipper_repo(need_notification)
+        self.event_loop.create_task(coro)
+
+    async def _update_klipper_repo(self, notify: bool) -> None:
         async with self.cmd_request_lock:
+            umdb = self.cmd_helper.get_umdb()
+            await umdb.pop('klipper', None)
+            await self.updaters['klipper'].initialize()
             await self.updaters['klipper'].refresh()
-        if need_notification:
+        if notify:
             vinfo: Dict[str, Any] = {}
             for name, updater in self.updaters.items():
                 vinfo[name] = updater.get_update_status()
@@ -231,38 +232,40 @@ class UpdateManager:
         pstate: str = result.get('print_stats', {}).get('state', "")
         return pstate.lower() == "printing"
 
-    async def _handle_auto_refresh(self) -> None:
-        if await self._check_klippy_printing():
-            # Don't Refresh during a print
-            logging.info("Klippy is printing, auto refresh aborted")
-            return
-        cur_time = time.time()
-        cur_hour = time.localtime(cur_time).tm_hour
-        time_diff = cur_time - self.last_refresh_time
-        # Update packages if it has been more than 12 hours
-        # and the local time is between 12AM and 5AM
-        if time_diff < MIN_REFRESH_TIME or cur_hour >= MAX_PKG_UPDATE_HOUR:
-            # Not within the update time window
-            return
+    async def _handle_auto_refresh(self, eventtime: float) -> float:
+        cur_hour = time.localtime(time.time()).tm_hour
+        if self.initial_refresh_complete:
+            # Update when the local time is between 12AM and 5AM
+            if cur_hour >= MAX_UPDATE_HOUR:
+                return eventtime + UPDATE_REFRESH_INTERVAL
+            if await self._check_klippy_printing():
+                # Don't Refresh during a print
+                logging.info("Klippy is printing, auto refresh aborted")
+                return eventtime + UPDATE_REFRESH_INTERVAL
         vinfo: Dict[str, Any] = {}
+        need_notify = False
         async with self.cmd_request_lock:
             try:
                 for name, updater in list(self.updaters.items()):
-                    await updater.refresh()
+                    if updater.needs_refresh():
+                        await updater.refresh()
+                        need_notify = True
                     vinfo[name] = updater.get_update_status()
             except Exception:
                 logging.exception("Unable to Refresh Status")
-                return
-        self.last_refresh_time = time.time()
-        uinfo = self.cmd_helper.get_rate_limit_stats()
-        uinfo['version_info'] = vinfo
-        uinfo['busy'] = self.cmd_helper.is_update_busy()
-        self.server.send_event("update_manager:update_refreshed", uinfo)
+                return eventtime + UPDATE_REFRESH_INTERVAL
+            finally:
+                self.initial_refresh_complete = True
+        if need_notify:
+            uinfo = self.cmd_helper.get_rate_limit_stats()
+            uinfo['version_info'] = vinfo
+            uinfo['busy'] = self.cmd_helper.is_update_busy()
+            self.server.send_event("update_manager:update_refreshed", uinfo)
+        return eventtime + UPDATE_REFRESH_INTERVAL
 
     async def _handle_update_request(self,
                                      web_request: WebRequest
                                      ) -> str:
-        await self.initialized_lock.wait()
         if await self._check_klippy_printing():
             raise self.server.error("Update Refused: Klippy is printing")
         app: str = web_request.get_endpoint().split("/")[-1]
@@ -293,8 +296,7 @@ class UpdateManager:
                                           ) -> str:
         async with self.cmd_request_lock:
             app_name = ""
-            self.cmd_helper.set_update_info('full', id(web_request),
-                                            full_complete=False)
+            self.cmd_helper.set_update_info('full', id(web_request))
             self.cmd_helper.notify_update_response(
                 "Preparing full software update...")
             try:
@@ -316,10 +318,13 @@ class UpdateManager:
                 kupdater = self.updaters.get('klipper')
                 if isinstance(kupdater, AppDeploy):
                     self.klippy_identified_evt = asyncio.Event()
-                    klippy_updated = True
+                    check_restart = True
                     if not await self._check_need_reinstall(app_name):
-                        klippy_updated = await kupdater.update()
-                    if klippy_updated:
+                        check_restart = await kupdater.update()
+                    if self.cmd_helper.needs_service_restart(app_name):
+                        await kupdater.restart_service()
+                        check_restart = True
+                    if check_restart:
                         self.cmd_helper.notify_update_response(
                             "Waiting for Klippy to reconnect (this may take"
                             " up to 2 minutes)...")
@@ -336,8 +341,11 @@ class UpdateManager:
 
                 # Update Moonraker
                 app_name = 'moonraker'
+                moon_updater = cast(AppDeploy, self.updaters["moonraker"])
                 if not await self._check_need_reinstall(app_name):
-                    await self.updaters['moonraker'].update()
+                    await moon_updater.update()
+                if self.cmd_helper.needs_service_restart(app_name):
+                    await moon_updater.restart_service()
                 self.cmd_helper.set_full_complete(True)
                 self.cmd_helper.notify_update_response(
                     "Full Update Complete", is_complete=True)
@@ -376,31 +384,33 @@ class UpdateManager:
     async def _handle_status_request(self,
                                      web_request: WebRequest
                                      ) -> Dict[str, Any]:
-        await self.initialized_lock.wait()
         check_refresh = web_request.get_boolean('refresh', False)
-        # Don't refresh if a print is currently in progress or
-        # if an update is in progress.  Just return the current
-        # state
-        if self.cmd_helper.is_update_busy() or \
-                await self._check_klippy_printing():
+        # Override a request to refresh if:
+        #   - An update is in progress
+        #   - Klippy is printing
+        if (
+            self.cmd_helper.is_update_busy() or
+            await self._check_klippy_printing() or
+            not self.initial_refresh_complete
+        ):
             check_refresh = False
-        need_refresh = False
+
         if check_refresh:
             # Acquire the command request lock if we want force a refresh
             await self.cmd_request_lock.acquire()
-            # If a request to refresh is received within 1 minute of
-            # a previous refresh, don't force a new refresh.  This gives
-            # clients a fresh state by acquiring the lock and waiting
-            # without unnecessary processing.
-            need_refresh = time.time() > (self.last_refresh_time + 60.)
+            # Now that we have acquired the lock reject attempts to spam
+            # the refresh request.
+            lrt = max([upd.get_last_refresh_time()
+                       for upd in self.updaters.values()])
+            if time.time() < lrt + 60.:
+                check_refresh = False
+                self.cmd_request_lock.release()
         vinfo: Dict[str, Any] = {}
         try:
             for name, updater in list(self.updaters.items()):
-                if need_refresh:
+                if check_refresh:
                     await updater.refresh()
                 vinfo[name] = updater.get_update_status()
-            if need_refresh:
-                self.last_refresh_time = time.time()
         except Exception:
             raise
         finally:
@@ -409,7 +419,7 @@ class UpdateManager:
         ret = self.cmd_helper.get_rate_limit_stats()
         ret['version_info'] = vinfo
         ret['busy'] = self.cmd_helper.is_update_busy()
-        if need_refresh:
+        if check_refresh:
             event_loop = self.server.get_event_loop()
             event_loop.delay_callback(
                 .2, self.server.send_event,
@@ -419,7 +429,6 @@ class UpdateManager:
     async def _handle_repo_recovery(self,
                                     web_request: WebRequest
                                     ) -> str:
-        await self.initialized_lock.wait()
         if await self._check_klippy_printing():
             raise self.server.error(
                 "Recovery Attempt Refused: Klippy is printing")
@@ -446,13 +455,14 @@ class UpdateManager:
         return "ok"
 
     def close(self) -> None:
-        self.cmd_helper.close()
-        if self.refresh_cb is not None:
-            self.refresh_cb.stop()
+        if self.refresh_timer is not None:
+            self.refresh_timer.stop()
 
 class CommandHelper:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
+        self.http_client: HttpClient
+        self.http_client = self.server.lookup_component("http_client")
         self.debug_enabled = config.getboolean('enable_repo_debug', False)
         if self.debug_enabled:
             logging.warning("UPDATE MANAGER: REPO DEBUG ENABLED")
@@ -460,8 +470,16 @@ class CommandHelper:
         self.scmd_error = shell_cmd.error
         self.build_shell_command = shell_cmd.build_shell_command
         self.pkg_updater: Optional[PackageDeploy] = None
-        self.http_client = AsyncHTTPClient()
-        self.github_request_cache: Dict[str, CachedGithubResponse] = {}
+
+        # database management
+        db: DBComp = self.server.lookup_component('database')
+        db.register_local_namespace("update_manager")
+        self.umdb = db.wrap_namespace("update_manager")
+
+        # Refresh Time Tracking (default is to refresh every 7 days)
+        reresh_interval = config.getint('refresh_interval', 168)
+        # Convert to seconds
+        self.refresh_interval = reresh_interval * 60 * 60
 
         # GitHub API Rate Limit Tracking
         self.gh_rate_limit: Optional[int] = None
@@ -471,29 +489,53 @@ class CommandHelper:
         # Update In Progress Tracking
         self.cur_update_app: Optional[str] = None
         self.cur_update_id: Optional[int] = None
+        self.full_update: bool = False
         self.full_complete: bool = False
+        self.pending_service_restarts: Set[str] = set()
 
     def get_server(self) -> Server:
         return self.server
 
+    def get_http_client(self) -> HttpClient:
+        return self.http_client
+
+    def get_refresh_interval(self) -> float:
+        return self.refresh_interval
+
+    def get_umdb(self) -> NamespaceWrapper:
+        return self.umdb
+
     def is_debug_enabled(self) -> bool:
         return self.debug_enabled
 
-    def set_update_info(self,
-                        app: str,
-                        uid: int,
-                        full_complete: bool = True
-                        ) -> None:
+    def set_update_info(self, app: str, uid: int) -> None:
         self.cur_update_app = app
         self.cur_update_id = uid
-        self.full_complete = full_complete
+        self.full_update = app == "full"
+        self.full_complete = not self.full_update
+        self.pending_service_restarts.clear()
+
+    def is_full_update(self) -> bool:
+        return self.full_update
+
+    def add_pending_restart(self, svc_name: str) -> None:
+        self.pending_service_restarts.add(svc_name)
+
+    def remove_pending_restart(self, svc_name: str) -> None:
+        if svc_name in self.pending_service_restarts:
+            self.pending_service_restarts.remove(svc_name)
 
     def set_full_complete(self, complete: bool = False):
         self.full_complete = complete
 
     def clear_update_info(self) -> None:
         self.cur_update_app = self.cur_update_id = None
+        self.full_update = False
         self.full_complete = False
+        self.pending_service_restarts.clear()
+
+    def needs_service_restart(self, svc_name: str) -> bool:
+        return svc_name in self.pending_service_restarts
 
     def is_app_updating(self, app_name: str) -> bool:
         return self.cur_update_app == app_name
@@ -503,36 +545,6 @@ class CommandHelper:
 
     def set_package_updater(self, updater: PackageDeploy) -> None:
         self.pkg_updater = updater
-
-    def get_rate_limit_stats(self) -> Dict[str, Any]:
-        return {
-            'github_rate_limit': self.gh_rate_limit,
-            'github_requests_remaining': self.gh_limit_remaining,
-            'github_limit_reset_time': self.gh_limit_reset_time,
-        }
-
-    async def init_api_rate_limit(self) -> None:
-        url = "https://api.github.com/rate_limit"
-        while 1:
-            try:
-                resp = await self.github_api_request(url, is_init=True)
-                assert isinstance(resp, dict)
-                core = resp['resources']['core']
-                self.gh_rate_limit = core['limit']
-                self.gh_limit_remaining = core['remaining']
-                self.gh_limit_reset_time = core['reset']
-            except Exception:
-                logging.exception("Error Initializing GitHub API Rate Limit")
-                await asyncio.sleep(30.)
-            else:
-                reset_time = time.ctime(self.gh_limit_reset_time)
-                logging.info(
-                    "GitHub API Rate Limit Initialized\n"
-                    f"Rate Limit: {self.gh_rate_limit}\n"
-                    f"Rate Limit Remaining: {self.gh_limit_remaining}\n"
-                    f"Rate Limit Reset Time: {reset_time}, "
-                    f"Seconds Since Epoch: {self.gh_limit_reset_time}")
-                break
 
     async def run_cmd(self,
                       cmd: str,
@@ -545,11 +557,10 @@ class CommandHelper:
                       ) -> None:
         cb = self.notify_update_response if notify else None
         scmd = self.build_shell_command(cmd, callback=cb, env=env, cwd=cwd)
-        while retries:
+        for _ in range(retries):
             if await scmd.run(timeout=timeout, sig_idx=sig_idx):
                 break
-            retries -= 1
-        if not retries:
+        else:
             raise self.server.error("Shell Command Error")
 
     async def run_cmd_with_response(self,
@@ -565,136 +576,6 @@ class CommandHelper:
                                               sig_idx=sig_idx)
         return result
 
-    async def github_api_request(self,
-                                 url: str,
-                                 is_init: Optional[bool] = False
-                                 ) -> JsonType:
-        if self.gh_limit_remaining == 0:
-            curtime = time.time()
-            assert self.gh_limit_reset_time is not None
-            if curtime < self.gh_limit_reset_time:
-                raise self.server.error(
-                    f"GitHub Rate Limit Reached\nRequest: {url}\n"
-                    f"Limit Reset Time: {time.ctime(self.gh_limit_remaining)}")
-        if url in self.github_request_cache:
-            cached_request = self.github_request_cache[url]
-            etag: Optional[str] = cached_request.get_etag()
-        else:
-            cached_request = CachedGithubResponse()
-            etag = None
-            self.github_request_cache[url] = cached_request
-        headers = {"Accept": "application/vnd.github.v3+json"}
-        if etag is not None:
-            headers['If-None-Match'] = etag
-        retries = 5
-        while retries:
-            try:
-                fut = self.http_client.fetch(
-                    url, headers=headers, connect_timeout=5.,
-                    request_timeout=5., raise_error=False)
-                resp: HTTPResponse
-                resp = await asyncio.wait_for(fut, 10.)
-            except Exception:
-                retries -= 1
-                if retries > 0:
-                    logging.exception(
-                        f"Error Processing GitHub API request: {url}")
-                    await asyncio.sleep(1.)
-                continue
-            etag = resp.headers.get('etag', None)
-            if etag is not None:
-                if etag[:2] == "W/":
-                    etag = etag[2:]
-            logging.info(
-                "GitHub API Request Processed\n"
-                f"URL: {url}\n"
-                f"Response Code: {resp.code}\n"
-                f"Response Reason: {resp.reason}\n"
-                f"ETag: {etag}")
-            if resp.code == 403:
-                raise self.server.error(
-                    f"Forbidden GitHub Request: {resp.reason}")
-            elif resp.code == 304:
-                logging.info(f"Github Request not Modified: {url}")
-                return cached_request.get_cached_result()
-            if resp.code != 200:
-                retries -= 1
-                if not retries:
-                    raise self.server.error(
-                        f"Github Request failed: {resp.code} {resp.reason}")
-                logging.info(
-                    f"Github request error, {retries} retries remaining")
-                await asyncio.sleep(1.)
-                continue
-            # Update rate limit on return success
-            if 'X-Ratelimit-Limit' in resp.headers and not is_init:
-                self.gh_rate_limit = int(resp.headers['X-Ratelimit-Limit'])
-                self.gh_limit_remaining = int(
-                    resp.headers['X-Ratelimit-Remaining'])
-                self.gh_limit_reset_time = float(
-                    resp.headers['X-Ratelimit-Reset'])
-            decoded = json.loads(resp.body)
-            if etag is not None:
-                cached_request.update_result(etag, decoded)
-            return decoded
-        raise self.server.error(
-            f"Retries exceeded for GitHub API request: {url}")
-
-    async def http_download_request(self,
-                                    url: str,
-                                    content_type: str,
-                                    timeout: float = 180.
-                                    ) -> bytes:
-        retries = 5
-        while retries:
-            try:
-                fut = self.http_client.fetch(
-                    url, headers={"Accept": content_type},
-                    connect_timeout=5., request_timeout=timeout)
-                resp: HTTPResponse
-                resp = await asyncio.wait_for(fut, timeout + 10.)
-            except Exception:
-                retries -= 1
-                logging.exception("Error Processing Download")
-                if not retries:
-                    raise
-                await asyncio.sleep(1.)
-                continue
-            return resp.body
-        raise self.server.error(
-            f"Retries exceeded for GitHub API request: {url}")
-
-    async def streaming_download_request(self,
-                                         url: str,
-                                         dest: Union[str, pathlib.Path],
-                                         content_type: str,
-                                         size: int,
-                                         timeout: float = 180.
-                                         ) -> None:
-        if isinstance(dest, str):
-            dest = pathlib.Path(dest)
-        retries = 5
-        while retries:
-            dl = StreamingDownload(self, dest, size)
-            try:
-                fut = self.http_client.fetch(
-                    url, headers={"Accept": content_type},
-                    connect_timeout=5., request_timeout=timeout,
-                    streaming_callback=dl.on_chunk_recd)
-                resp: HTTPResponse
-                resp = await asyncio.wait_for(fut, timeout + 10.)
-            except Exception:
-                retries -= 1
-                logging.exception("Error Processing Download")
-                if not retries:
-                    raise
-                await asyncio.sleep(1.)
-                continue
-            finally:
-                await dl.close()
-            if resp.code < 400:
-                return
-
     def notify_update_response(self,
                                resp: Union[str, bytes],
                                is_complete: bool = False
@@ -704,7 +585,9 @@ class CommandHelper:
         resp = resp.strip()
         if isinstance(resp, bytes):
             resp = resp.decode()
-        done = is_complete and self.full_complete
+        done = is_complete
+        if self.full_update:
+            done &= self.full_complete
         notification = {
             'message': resp,
             'application': self.cur_update_app,
@@ -721,134 +604,181 @@ class CommandHelper:
             return
         await self.pkg_updater.install_packages(package_list, **kwargs)
 
-    def close(self) -> None:
-        self.http_client.close()
+    def get_rate_limit_stats(self):
+        return self.http_client.github_api_stats()
 
-class CachedGithubResponse:
-    def __init__(self) -> None:
-        self.etag: Optional[str] = None
-        self.cached_result: JsonType = {}
+    def on_download_progress(self,
+                             progress: int,
+                             download_size: int,
+                             downloaded: int
+                             ) -> None:
+        totals = (
+            f"{downloaded // 1024} KiB / "
+            f"{download_size// 1024} KiB"
+        )
+        self.notify_update_response(
+            f"Downloading {self.cur_update_app}: {totals} [{progress}%]")
 
-    def get_etag(self) -> Optional[str]:
-        return self.etag
+    async def create_tempdir(self, suffix=None, prefix=None):
+        def _createdir(sfx, pfx):
+            return tempfile.TemporaryDirectory(suffix=sfx, prefix=pfx)
 
-    def get_cached_result(self) -> JsonType:
-        return self.cached_result
-
-    def update_result(self, etag: str, result: JsonType) -> None:
-        self.etag = etag
-        self.cached_result = result
-
-class StreamingDownload:
-    def __init__(self,
-                 cmd_helper: CommandHelper,
-                 dest: pathlib.Path,
-                 download_size: int) -> None:
-        self.cmd_helper = cmd_helper
-        self.event_loop = cmd_helper.get_server().get_event_loop()
-        self.name = dest.name
-        self.file_hdl = dest.open('wb')
-        self.download_size = download_size
-        self.total_recd: int = 0
-        self.last_pct: int = 0
-        self.chunk_buffer: List[bytes] = []
-        self.busy_evt: asyncio.Event = asyncio.Event()
-        self.busy_evt.set()
-
-    def on_chunk_recd(self, chunk: bytes) -> None:
-        if not chunk:
-            return
-        self.chunk_buffer.append(chunk)
-        if not self.busy_evt.is_set():
-            return
-        self.busy_evt.clear()
-        self.event_loop.register_callback(self._process_buffer)
-
-    async def close(self):
-        await self.busy_evt.wait()
-        self.file_hdl.close()
-
-    async def _process_buffer(self):
-        while self.chunk_buffer:
-            chunk = self.chunk_buffer.pop(0)
-            self.total_recd += len(chunk)
-            pct = int(self.total_recd / self.download_size * 100 + .5)
-            await self.event_loop.run_in_thread(self.file_hdl.write, chunk)
-            if pct >= self.last_pct + 5:
-                self.last_pct = pct
-                totals = f"{self.total_recd // 1024} KiB / " \
-                         f"{self.download_size // 1024} KiB"
-                self.cmd_helper.notify_update_response(
-                    f"Downloading {self.name}: {totals} [{pct}%]")
-        self.busy_evt.set()
+        eventloop = self.server.get_event_loop()
+        return await eventloop.run_in_thread(_createdir, suffix, prefix)
 
 class PackageDeploy(BaseDeploy):
-    APT_CMD = "sudo DEBIAN_FRONTEND=noninteractive apt-get"
     def __init__(self,
                  config: ConfigHelper,
                  cmd_helper: CommandHelper
                  ) -> None:
-        super().__init__(config, cmd_helper)
+        super().__init__(config, cmd_helper, "system", "", "")
         cmd_helper.set_package_updater(self)
+        self.use_packagekit = config.getboolean("enable_packagekit", True)
         self.available_packages: List[str] = []
-        self.refresh_evt: Optional[asyncio.Event] = None
-        # Initialze to current time so an update is not performed on init
-        self.last_apt_update_time: float = time.time()
-        self.mutex: asyncio.Lock = asyncio.Lock()
 
-    async def refresh(self, fetch_packages: bool = True) -> None:
-        # TODO: Use python-apt python lib rather than command line for updates
-        if self.refresh_evt is not None:
-            self.refresh_evt.wait()
-            return
-        async with self.mutex:
-            self.refresh_evt = asyncio.Event()
+    async def initialize(self) -> Dict[str, Any]:
+        storage = await super().initialize()
+        self.available_packages = storage.get('packages', [])
+        provider: BasePackageProvider
+        try_fallback = True
+        if self.use_packagekit:
             try:
-                await self._update_apt(force=fetch_packages)
-                res = await self.cmd_helper.run_cmd_with_response(
-                    "apt list --upgradable", timeout=60.)
-                pkg_list = [p.strip() for p in res.split("\n") if p.strip()]
-                if pkg_list:
-                    pkg_list = pkg_list[2:]
-                    self.available_packages = [p.split("/", maxsplit=1)[0]
-                                               for p in pkg_list]
-                pkg_msg = "\n".join(self.available_packages)
-                logging.info(
-                    f"Detected {len(self.available_packages)} package updates:"
-                    f"\n{pkg_msg}")
+                provider = PackageKitProvider(self.cmd_helper)
+                await provider.initialize()
             except Exception:
-                logging.exception("Error Refreshing System Packages")
-            self.refresh_evt.set()
-            self.refresh_evt = None
+                pass
+            else:
+                logging.info("PackageDeploy: Using PackageKit Provider")
+                try_fallback = False
+        if try_fallback:
+            # Check to see of the apt command is available
+            fallback = await self._get_fallback_provider()
+            if fallback is None:
+                provider = BasePackageProvider(self.cmd_helper)
+                machine: Machine = self.server.lookup_component("machine")
+                dist_info = machine.get_system_info()['distribution']
+                dist_id: str = dist_info['id'].lower()
+                self.server.add_warning(
+                    "Unable to initialize System Update Provider for "
+                    f"distribution: {dist_id}")
+            else:
+                logging.info("PackageDeploy: Using APT CLI Provider")
+                provider = fallback
+        self.provider = provider
+        return storage
+
+    async def _get_fallback_provider(self) -> Optional[BasePackageProvider]:
+        # Currently only the API Fallback provider is available
+        shell_cmd: SCMDComp
+        shell_cmd = self.server.lookup_component("shell_command")
+        cmd = shell_cmd.build_shell_command("sh -c 'command -v apt'")
+        try:
+            ret = await cmd.run_with_response()
+        except shell_cmd.error:
+            return None
+        # APT Command found should be available
+        logging.debug(f"APT package manager detected: {ret.encode()}")
+        provider = AptCliProvider(self.cmd_helper)
+        try:
+            await provider.initialize()
+        except Exception:
+            return None
+        return provider
+
+    async def refresh(self) -> None:
+        try:
+            # Do not force a refresh until the server has started
+            if self.server.is_running():
+                await self._update_package_cache(force=True)
+            self.available_packages = await self.provider.get_packages()
+            pkg_msg = "\n".join(self.available_packages)
+            logging.info(
+                f"Detected {len(self.available_packages)} package updates:"
+                f"\n{pkg_msg}")
+        except Exception:
+            logging.exception("Error Refreshing System Packages")
+        # Update Persistent Storage
+        self._save_state()
+
+    def get_persistent_data(self) -> Dict[str, Any]:
+        storage = super().get_persistent_data()
+        storage['packages'] = self.available_packages
+        return storage
 
     async def update(self) -> bool:
-        async with self.mutex:
-            if not self.available_packages:
-                return False
-            self.cmd_helper.notify_update_response("Updating packages...")
-            try:
-                await self._update_apt(force=True, notify=True)
-                await self.cmd_helper.run_cmd(
-                    f"{self.APT_CMD} upgrade --yes", timeout=3600.,
-                    notify=True)
-            except Exception:
-                raise self.server.error("Error updating system packages")
-            self.available_packages = []
-            self.cmd_helper.notify_update_response(
-                "Package update finished...", is_complete=True)
-            return True
+        if not self.available_packages:
+            return False
+        self.cmd_helper.notify_update_response("Updating packages...")
+        try:
+            await self._update_package_cache(force=True, notify=True)
+            await self.provider.upgrade_system()
+        except Exception:
+            raise self.server.error("Error updating system packages")
+        self.available_packages = []
+        self._save_state()
+        self.cmd_helper.notify_update_response(
+            "Package update finished...", is_complete=True)
+        return True
 
-    async def _update_apt(self,
-                          force: bool = False,
-                          notify: bool = False
-                          ) -> None:
+    async def _update_package_cache(self,
+                                    force: bool = False,
+                                    notify: bool = False
+                                    ) -> None:
         curtime = time.time()
-        if force or curtime > self.last_apt_update_time + 3600.:
+        if force or curtime > self.last_refresh_time + 3600.:
             # Don't update if a request was done within the last hour
-            await self.cmd_helper.run_cmd(
-                f"{self.APT_CMD} update --allow-releaseinfo-change",
-                timeout=300., notify=notify)
-            self.last_apt_update_time = time.time()
+            await self.provider.refresh_packages(notify)
+
+    async def install_packages(self,
+                               package_list: List[str],
+                               **kwargs
+                               ) -> None:
+        await self.provider.install_packages(package_list, **kwargs)
+
+    def get_update_status(self) -> Dict[str, Any]:
+        return {
+            'package_count': len(self.available_packages),
+            'package_list': self.available_packages
+        }
+
+class BasePackageProvider:
+    def __init__(self, cmd_helper: CommandHelper) -> None:
+        self.server = cmd_helper.get_server()
+        self.cmd_helper = cmd_helper
+
+    async def initialize(self) -> None:
+        pass
+
+    async def refresh_packages(self, notify: bool = False) -> None:
+        raise self.server.error("Cannot refresh packages, no provider set")
+
+    async def get_packages(self) -> List[str]:
+        raise self.server.error("Cannot retrieve packages, no provider set")
+
+    async def install_packages(self,
+                               package_list: List[str],
+                               **kwargs
+                               ) -> None:
+        raise self.server.error("Cannot install packages, no provider set")
+
+    async def upgrade_system(self) -> None:
+        raise self.server.error("Cannot upgrade packages, no provider set")
+
+class AptCliProvider(BasePackageProvider):
+    APT_CMD = "sudo DEBIAN_FRONTEND=noninteractive apt-get"
+
+    async def refresh_packages(self, notify: bool = False) -> None:
+        await self.cmd_helper.run_cmd(
+            f"{self.APT_CMD} update", timeout=600., notify=notify)
+
+    async def get_packages(self) -> List[str]:
+        res = await self.cmd_helper.run_cmd_with_response(
+            "apt list --upgradable", timeout=60.)
+        pkg_list = [p.strip() for p in res.split("\n") if p.strip()]
+        if pkg_list:
+            pkg_list = pkg_list[2:]
+            return [p.split("/", maxsplit=1)[0] for p in pkg_list]
+        return []
 
     async def install_packages(self,
                                package_list: List[str],
@@ -858,45 +788,387 @@ class PackageDeploy(BaseDeploy):
         retries: int = kwargs.get('retries', 3)
         notify: bool = kwargs.get('notify', False)
         pkgs = " ".join(package_list)
-        await self._update_apt(notify=notify)
+        await self.refresh_packages(notify=notify)
         await self.cmd_helper.run_cmd(
             f"{self.APT_CMD} install --yes {pkgs}", timeout=timeout,
             retries=retries, notify=notify)
 
-    def get_update_status(self) -> Dict[str, Any]:
-        return {
-            'package_count': len(self.available_packages),
-            'package_list': self.available_packages
-        }
+    async def upgrade_system(self) -> None:
+        await self.cmd_helper.run_cmd(
+            f"{self.APT_CMD} upgrade --yes", timeout=3600.,
+            notify=True)
+
+class PackageKitProvider(BasePackageProvider):
+    def __init__(self, cmd_helper: CommandHelper) -> None:
+        super().__init__(cmd_helper)
+        dbus_mgr: DbusManager = self.server.lookup_component("dbus_manager")
+        self.dbus_mgr = dbus_mgr
+        self.pkgkit: Optional[ProxyInterface] = None
+
+    async def initialize(self) -> None:
+        if not self.dbus_mgr.is_connected():
+            raise self.server.error("DBus Connection Not available")
+        # Check for PolicyKit permissions
+        await self.dbus_mgr.check_permission(
+            "org.freedesktop.packagekit.system-sources-refresh",
+            "The Update Manager will fail to fetch package updates")
+        await self.dbus_mgr.check_permission(
+            "org.freedesktop.packagekit.package-install",
+            "The Update Manager will fail to install packages")
+        await self.dbus_mgr.check_permission(
+            "org.freedesktop.packagekit.system-update",
+            "The Update Manager will fail to update packages"
+        )
+        # Fetch the PackageKit DBus Inteface
+        self.pkgkit = await self.dbus_mgr.get_interface(
+            "org.freedesktop.PackageKit",
+            "/org/freedesktop/PackageKit",
+            "org.freedesktop.PackageKit")
+
+    async def refresh_packages(self, notify: bool = False) -> None:
+        await self.run_transaction("refresh_cache", False, notify=notify)
+
+    async def get_packages(self) -> List[str]:
+        flags = PkEnum.Filter.NONE
+        pkgs = await self.run_transaction("get_updates", flags.value)
+        pkg_ids = [info['package_id'] for info in pkgs if 'package_id' in info]
+        return [pkg_id.split(";")[0] for pkg_id in pkg_ids]
+
+    async def install_packages(self,
+                               package_list: List[str],
+                               **kwargs
+                               ) -> None:
+        notify: bool = kwargs.get('notify', False)
+        await self.refresh_packages(notify=notify)
+        flags = PkEnum.Filter.NEWEST | PkEnum.Filter.NOT_INSTALLED | \
+            PkEnum.Filter.BASENAME
+        pkgs = await self.run_transaction("resolve", flags.value, package_list)
+        pkg_ids = [info['package_id'] for info in pkgs if 'package_id' in info]
+        if pkg_ids:
+            tflag = PkEnum.TransactionFlag.ONLY_TRUSTED
+            await self.run_transaction("install_packages", tflag.value,
+                                       pkg_ids, notify=notify)
+
+    async def upgrade_system(self) -> None:
+        # Get Updates, Install Packages
+        flags = PkEnum.Filter.NONE
+        pkgs = await self.run_transaction("get_updates", flags.value)
+        pkg_ids = [info['package_id'] for info in pkgs if 'package_id' in info]
+        if pkg_ids:
+            tflag = PkEnum.TransactionFlag.ONLY_TRUSTED
+            await self.run_transaction("update_packages", tflag.value,
+                                       pkg_ids, notify=True)
+
+    def create_transaction(self) -> PackageKitTransaction:
+        if self.pkgkit is None:
+            raise self.server.error("PackageKit Interface Not Available")
+        return PackageKitTransaction(self.dbus_mgr, self.pkgkit,
+                                     self.cmd_helper)
+
+    async def run_transaction(self,
+                              method: str,
+                              *args,
+                              notify: bool = False
+                              ) -> Any:
+        transaction = self.create_transaction()
+        return await transaction.run(method, *args, notify=notify)
+
+class PackageKitTransaction:
+    GET_PKG_ROLES = (
+        PkEnum.Role.RESOLVE | PkEnum.Role.GET_PACKAGES |
+        PkEnum.Role.GET_UPDATES
+    )
+    QUERY_ROLES = GET_PKG_ROLES | PkEnum.Role.GET_REPO_LIST
+    PROGRESS_STATUS = (
+        PkEnum.Status.RUNNING | PkEnum.Status.INSTALL |
+        PkEnum.Status.UPDATE
+    )
+
+    def __init__(self,
+                 dbus_mgr: DbusManager,
+                 pkgkit: ProxyInterface,
+                 cmd_helper: CommandHelper
+                 ) -> None:
+        self.server = cmd_helper.get_server()
+        self.eventloop = self.server.get_event_loop()
+        self.cmd_helper = cmd_helper
+        self.dbus_mgr = dbus_mgr
+        self.pkgkit = pkgkit
+        # Transaction Properties
+        self.notify = False
+        self._status = PkEnum.Status.UNKNOWN
+        self._role = PkEnum.Role.UNKNOWN
+        self._tflags = PkEnum.TransactionFlag.NONE
+        self._percentage = 101
+        self._dl_remaining = 0
+        self.speed = 0
+        self.elapsed_time = 0
+        self.remaining_time = 0
+        self.caller_active = False
+        self.allow_cancel = True
+        self.uid = 0
+        # Transaction data tracking
+        self.tfut: Optional[asyncio.Future] = None
+        self.last_progress_notify_time: float = 0.
+        self.result: List[Dict[str, Any]] = []
+        self.err_msg: str = ""
+
+    def run(self,
+            method: str,
+            *args,
+            notify: bool = False
+            ) -> Awaitable:
+        if self.tfut is not None:
+            raise self.server.error(
+                "PackageKit transaction can only be used once")
+        self.notify = notify
+        self.tfut = self.eventloop.create_future()
+        coro = self._start_transaction(method, *args)
+        self.eventloop.create_task(coro)
+        return self.tfut
+
+    async def _start_transaction(self,
+                                 method: str,
+                                 *args
+                                 ) -> None:
+        assert self.tfut is not None
+        try:
+            # Create Transaction
+            tid = await self.pkgkit.call_create_transaction()  # type: ignore
+            transaction, props = await self.dbus_mgr.get_interfaces(
+                "org.freedesktop.PackageKit", tid,
+                ["org.freedesktop.PackageKit.Transaction",
+                 "org.freedesktop.DBus.Properties"])
+            # Set interface callbacks
+            transaction.on_package(self._on_package_signal)    # type: ignore
+            transaction.on_repo_detail(                        # type: ignore
+                self._on_repo_detail_signal)
+            transaction.on_item_progress(                      # type: ignore
+                self._on_item_progress_signal)
+            transaction.on_error_code(self._on_error_signal)   # type: ignore
+            transaction.on_finished(self._on_finished_signal)  # type: ignore
+            props.on_properties_changed(                       # type: ignore
+                self._on_properties_changed)
+            # Run method
+            logging.debug(f"PackageKit: Running transaction call_{method}")
+            func = getattr(transaction, f"call_{method}")
+            await func(*args)
+        except Exception as e:
+            self.tfut.set_exception(e)
+
+    def _on_package_signal(self,
+                           info_code: int,
+                           package_id: str,
+                           summary: str
+                           ) -> None:
+        info = PkEnum.Info.from_index(info_code)
+        if self._role in self.GET_PKG_ROLES:
+            pkg_data = {
+                'package_id': package_id,
+                'info': info.desc,
+                'summary': summary
+            }
+            self.result.append(pkg_data)
+        else:
+            self._notify_package(info, package_id)
+
+    def _on_repo_detail_signal(self,
+                               repo_id: str,
+                               description: str,
+                               enabled: bool
+                               ) -> None:
+        if self._role == PkEnum.Role.GET_REPO_LIST:
+            repo_data = {
+                "repo_id": repo_id,
+                "description": description,
+                "enabled": enabled
+            }
+            self.result.append(repo_data)
+        else:
+            self._notify_repo(repo_id, description)
+
+    def _on_item_progress_signal(self,
+                                 item_id: str,
+                                 status_code: int,
+                                 percent_complete: int
+                                 ) -> None:
+        status = PkEnum.Status.from_index(status_code)
+        # NOTE: This signal doesn't seem to fire predictably,
+        # nor does it seem to provide a consistent "percent complete"
+        # parameter.
+        # logging.debug(
+        #    f"Role {self._role.name}: Item Progress Signal Received\n"
+        #    f"Item ID: {item_id}\n"
+        #    f"Percent Complete: {percent_complete}\n"
+        #    f"Status: {status.desc}")
+
+    def _on_error_signal(self,
+                         error_code: int,
+                         details: str
+                         ) -> None:
+        err = PkEnum.Error.from_index(error_code)
+        self.err_msg = f"{err.name}: {details}"
+
+    def _on_finished_signal(self, exit_code: int, run_time: int) -> None:
+        if self.tfut is None:
+            return
+        ext = PkEnum.Exit.from_index(exit_code)
+        secs = run_time / 1000.
+        if ext == PkEnum.Exit.SUCCESS:
+            self.tfut.set_result(self.result)
+        else:
+            err = self.err_msg or ext.desc
+            server = self.cmd_helper.get_server()
+            self.tfut.set_exception(server.error(err))
+        msg = f"Transaction {self._role.desc}: Exit {ext.desc}, " \
+              f"Run time: {secs:.2f} seconds"
+        if self.notify:
+            self.cmd_helper.notify_update_response(msg)
+        logging.debug(msg)
+
+    def _on_properties_changed(self,
+                               iface_name: str,
+                               changed_props: Dict[str, Variant],
+                               invalid_props: Dict[str, Variant]
+                               ) -> None:
+        for name, var in changed_props.items():
+            formatted = re.sub(r"(\w)([A-Z])", r"\g<1>_\g<2>", name).lower()
+            setattr(self, formatted, var.value)
+
+    def _notify_package(self, info: PkEnum.Info, package_id: str) -> None:
+        if self.notify:
+            if info == PkEnum.Info.FINISHED:
+                return
+            pkg_parts = package_id.split(";")
+            msg = f"{info.desc}: {pkg_parts[0]} ({pkg_parts[1]})"
+            self.cmd_helper.notify_update_response(msg)
+
+    def _notify_repo(self, repo_id: str, description: str) -> None:
+        if self.notify:
+            if not repo_id.strip():
+                repo_id = description
+            # TODO: May want to eliminate dups
+            msg = f"GET: {repo_id}"
+            self.cmd_helper.notify_update_response(msg)
+
+    def _notify_progress(self) -> None:
+        if self.notify and self._percentage <= 100:
+            msg = f"{self._status.desc}...{self._percentage}%"
+            if self._status == PkEnum.Status.DOWNLOAD and self._dl_remaining:
+                if self._dl_remaining < 1024:
+                    msg += f", Remaining: {self._dl_remaining} B"
+                elif self._dl_remaining < 1048576:
+                    msg += f", Remaining: {self._dl_remaining // 1024} KiB"
+                else:
+                    msg += f", Remaining: {self._dl_remaining // 1048576} MiB"
+                if self.speed:
+                    speed = self.speed // 8
+                    if speed < 1024:
+                        msg += f", Speed: {speed} B/s"
+                    elif speed < 1048576:
+                        msg += f", Speed: {speed // 1024} KiB/s"
+                    else:
+                        msg += f", Speed: {speed // 1048576} MiB/s"
+            self.cmd_helper.notify_update_response(msg)
+
+    @property
+    def role(self) -> PkEnum.Role:
+        return self._role
+
+    @role.setter
+    def role(self, role_code: int) -> None:
+        self._role = PkEnum.Role.from_index(role_code)
+        if self._role in self.QUERY_ROLES:
+            # Never Notify Queries
+            self.notify = False
+        if self.notify:
+            msg = f"Transaction {self._role.desc} started..."
+            self.cmd_helper.notify_update_response(msg)
+        logging.debug(f"PackageKit: Current Role: {self._role.desc}")
+
+    @property
+    def status(self) -> PkEnum.Status:
+        return self._status
+
+    @status.setter
+    def status(self, status_code: int) -> None:
+        self._status = PkEnum.Status.from_index(status_code)
+        self._percentage = 101
+        self.speed = 0
+        logging.debug(f"PackageKit: Current Status: {self._status.desc}")
+
+    @property
+    def transaction_flags(self) -> PkEnum.TransactionFlag:
+        return self._tflags
+
+    @transaction_flags.setter
+    def transaction_flags(self, bits: int) -> None:
+        self._tflags = PkEnum.TransactionFlag(bits)
+
+    @property
+    def percentage(self) -> int:
+        return self._percentage
+
+    @percentage.setter
+    def percentage(self, percent: int) -> None:
+        self._percentage = percent
+        if self._status in self.PROGRESS_STATUS:
+            self._notify_progress()
+
+    @property
+    def download_size_remaining(self) -> int:
+        return self._dl_remaining
+
+    @download_size_remaining.setter
+    def download_size_remaining(self, bytes_remaining: int) -> None:
+        self._dl_remaining = bytes_remaining
+        self._notify_progress()
 
 class WebClientDeploy(BaseDeploy):
     def __init__(self,
                  config: ConfigHelper,
                  cmd_helper: CommandHelper
                  ) -> None:
-        super().__init__(config, cmd_helper)
+        super().__init__(config, cmd_helper, prefix="Web Client")
         self.repo = config.get('repo').strip().strip("/")
         self.owner = self.repo.split("/", 1)[0]
         self.path = pathlib.Path(config.get("path")).expanduser().resolve()
         self.type = config.get('type')
-        self.channel = "stable" if self.type == "web" else "beta"
+        def_channel = "stable"
+        if self.type == "web_beta":
+            def_channel = "beta"
+            self.server.add_warning(
+                f"Config Section [{config.get_name()}], option 'type': "
+                "web_beta', value 'web_beta' is deprecated.  Set 'type' to "
+                "web and 'channel' to 'beta'")
+            self.type = "zip"
+        self.channel = config.get("channel", def_channel)
+        if self.channel not in ["stable", "beta"]:
+            raise config.error(
+                f"Invalid Channel '{self.channel}' for config "
+                f"section [{config.get_name()}], type: {self.type}. "
+                f"Must be one of the following: stable, beta")
+        self.info_tags: List[str] = config.getlist("info_tags", [])
         self.persistent_files: List[str] = []
-        pfiles = config.get('persistent_files', None)
+        pfiles = config.getlist('persistent_files', None)
         if pfiles is not None:
-            self.persistent_files = [pf.strip().strip("/") for pf in
-                                     pfiles.split("\n") if pf.strip()]
+            self.persistent_files = [pf.strip("/") for pf in pfiles]
             if ".version" in self.persistent_files:
                 raise config.error(
                     "Invalid value for option 'persistent_files': "
                     "'.version' can not be persistent")
-        self.version: str = "?"
-        self.remote_version: str = "?"
-        self.dl_info: Tuple[str, str, int] = ("?", "?", 0)
-        self.refresh_evt: Optional[asyncio.Event] = None
-        self.mutex: asyncio.Lock = asyncio.Lock()
+
+    async def initialize(self) -> Dict[str, Any]:
+        storage = await super().initialize()
+        self.version: str = storage.get('version', "?")
+        self.remote_version: str = storage.get('remote_version', "?")
+        dl_info: List[Any] = storage.get('dl_info', ["?", "?", 0])
+        self.dl_info: Tuple[str, str, int] = cast(
+            Tuple[str, str, int], tuple(dl_info))
         logging.info(f"\nInitializing Client Updater: '{self.name}',"
                      f"\nChannel: {self.channel}"
                      f"\npath: {self.path}")
+        return storage
 
     async def _get_local_version(self) -> None:
         version_path = self.path.joinpath(".version")
@@ -908,37 +1180,41 @@ class WebClientDeploy(BaseDeploy):
             self.version = "?"
 
     async def refresh(self) -> None:
-        if self.refresh_evt is not None:
-            self.refresh_evt.wait()
-            return
-        async with self.mutex:
-            self.refresh_evt = asyncio.Event()
-            try:
-                await self._get_local_version()
-                await self._get_remote_version()
-            except Exception:
-                logging.exception("Error Refreshing Client")
-            self.refresh_evt.set()
-            self.refresh_evt = None
+        try:
+            await self._get_local_version()
+            await self._get_remote_version()
+        except Exception:
+            logging.exception("Error Refreshing Client")
+        self._save_state()
 
     async def _get_remote_version(self) -> None:
         # Remote state
-        url = f"https://api.github.com/repos/{self.repo}/releases"
-        try:
-            releases = await self.cmd_helper.github_api_request(url)
-            assert isinstance(releases, list)
-        except Exception:
-            logging.exception(f"Client {self.repo}: Github Request Error")
-            releases = []
-        result: Dict[str, Any] = {}
-        for release in releases:
-            if self.channel == "stable":
-                if not release['prerelease']:
-                    result = release
-                    break
+        if self.channel == "stable":
+            resource = f"repos/{self.repo}/releases/latest"
+        else:
+            resource = f"repos/{self.repo}/releases?per_page=1"
+        client = self.cmd_helper.get_http_client()
+        resp = await client.github_api_request(resource, attempts=3)
+        release: Union[List[Any], Dict[str, Any]] = {}
+        if resp.status_code == 304:
+            if self.remote_version == "?" and resp.content:
+                # Not modified, however we need to restore state from
+                # cached content
+                release = resp.json()
             else:
-                result = release
-                break
+                # Either not necessary or not possible to restore from cache
+                return
+        elif resp.has_error():
+            logging.info(
+                f"Client {self.repo}: Github Request Error - {resp.error}")
+        else:
+            release = resp.json()
+        result: Dict[str, Any] = {}
+        if isinstance(release, list):
+            if release:
+                result = release[0]
+        else:
+            result = release
         self.remote_version = result.get('name', "?")
         release_asset: Dict[str, Any] = result.get('assets', [{}])[0]
         dl_url: str = release_asset.get('browser_download_url', "?")
@@ -954,45 +1230,56 @@ class WebClientDeploy(BaseDeploy):
             f"size: {size}\n"
             f"Content Type: {content_type}")
 
+    def get_persistent_data(self) -> Dict[str, Any]:
+        storage = super().get_persistent_data()
+        storage['version'] = self.version
+        storage['remote_version'] = self.remote_version
+        storage['dl_info'] = list(self.dl_info)
+        return storage
+
     async def update(self) -> bool:
-        async with self.mutex:
+        if self.remote_version == "?":
+            await self._get_remote_version()
             if self.remote_version == "?":
-                await self._get_remote_version()
-                if self.remote_version == "?":
-                    raise self.server.error(
-                        f"Client {self.repo}: Unable to locate update")
-            dl_url, content_type, size = self.dl_info
-            if dl_url == "?":
                 raise self.server.error(
-                    f"Client {self.repo}: Invalid download url")
-            if self.version == self.remote_version:
-                # Already up to date
-                return False
-            event_loop = self.server.get_event_loop()
+                    f"Client {self.repo}: Unable to locate update")
+        dl_url, content_type, size = self.dl_info
+        if dl_url == "?":
+            raise self.server.error(
+                f"Client {self.repo}: Invalid download url")
+        if self.version == self.remote_version:
+            # Already up to date
+            return False
+        event_loop = self.server.get_event_loop()
+        self.cmd_helper.notify_update_response(
+            f"Updating Web Client {self.name}...")
+        self.cmd_helper.notify_update_response(
+            f"Downloading Client: {self.name}")
+        td = await self.cmd_helper.create_tempdir(self.name, "client")
+        try:
+            tempdir = pathlib.Path(td.name)
+            temp_download_file = tempdir.joinpath(f"{self.name}.zip")
+            temp_persist_dir = tempdir.joinpath(self.name)
+            client = self.cmd_helper.get_http_client()
+            await client.download_file(
+                dl_url, content_type, temp_download_file, size,
+                self.cmd_helper.on_download_progress)
             self.cmd_helper.notify_update_response(
-                f"Updating Web Client {self.name}...")
-            self.cmd_helper.notify_update_response(
-                f"Downloading Client: {self.name}")
-            with tempfile.TemporaryDirectory(
-                    suffix=self.name, prefix="client") as tempdirname:
-                tempdir = pathlib.Path(tempdirname)
-                temp_download_file = tempdir.joinpath(f"{self.name}.zip")
-                temp_persist_dir = tempdir.joinpath(self.name)
-                await self.cmd_helper.streaming_download_request(
-                    dl_url, temp_download_file, content_type, size)
-                self.cmd_helper.notify_update_response(
-                    f"Download Complete, extracting release to '{self.path}'")
-                await event_loop.run_in_thread(
-                    self._extract_release, temp_persist_dir,
-                    temp_download_file)
-            self.version = self.remote_version
-            version_path = self.path.joinpath(".version")
-            if not version_path.exists():
-                await event_loop.run_in_thread(
-                    version_path.write_text, self.version)
-            self.cmd_helper.notify_update_response(
-                f"Client Update Finished: {self.name}", is_complete=True)
-            return True
+                f"Download Complete, extracting release to '{self.path}'")
+            await event_loop.run_in_thread(
+                self._extract_release, temp_persist_dir,
+                temp_download_file)
+        finally:
+            await event_loop.run_in_thread(td.cleanup)
+        self.version = self.remote_version
+        version_path = self.path.joinpath(".version")
+        if not version_path.exists():
+            await event_loop.run_in_thread(
+                version_path.write_text, self.version)
+        self.cmd_helper.notify_update_response(
+            f"Client Update Finished: {self.name}", is_complete=True)
+        self._save_state()
+        return True
 
     def _extract_release(self,
                          persist_dir: pathlib.Path,
@@ -1026,7 +1313,8 @@ class WebClientDeploy(BaseDeploy):
             'version': self.version,
             'remote_version': self.remote_version,
             'configured_type': self.type,
-            'channel': self.channel
+            'channel': self.channel,
+            'info_tags': self.info_tags
         }
 
 def load_component(config: ConfigHelper) -> UpdateManager:

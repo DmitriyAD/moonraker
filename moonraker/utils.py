@@ -8,16 +8,21 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import glob
+import importlib
 import pathlib
 import sys
 import subprocess
 import asyncio
 import hashlib
 import json
+import shlex
+import re
 from queue import SimpleQueue as Queue
 
 # Annotation imports
 from typing import (
+    TYPE_CHECKING,
     List,
     Optional,
     ClassVar,
@@ -26,7 +31,12 @@ from typing import (
     Any,
 )
 
-MOONRAKER_PATH = os.path.join(os.path.dirname(__file__), '..')
+if TYPE_CHECKING:
+    from types import ModuleType
+
+MOONRAKER_PATH = str(pathlib.Path(__file__).parent.parent.resolve())
+SYS_MOD_PATHS = glob.glob("/usr/lib/python3*/dist-packages")
+SYS_MOD_PATHS += glob.glob("/usr/lib/python3*/site-packages")
 
 class ServerError(Exception):
     def __init__(self, message: str, status_code: int = 400) -> None:
@@ -77,25 +87,44 @@ class MoonrakerLoggingHandler(logging.handlers.TimedRotatingFileHandler):
         if self.stream is not None:
             self.stream.write("\n".join(lines) + "\n")
 
-# Parse the git version from the command line.  This code
-# is borrowed from Klipper.
-def retreive_git_version(source_path: str) -> str:
-    # Obtain version info from "git" program
-    prog = ('git', '-C', source_path, 'describe', '--always',
-            '--tags', '--long', '--dirty')
+def _run_git_command(cmd: str) -> str:
+    prog = shlex.split(cmd)
     process = subprocess.Popen(prog, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE)
-    ver, err = process.communicate()
+    ret, err = process.communicate()
     retcode = process.wait()
     if retcode == 0:
-        return ver.strip().decode()
-    raise Exception(f"Failed to retreive git version: {err.decode()}")
+        return ret.strip().decode()
+    raise Exception(f"Failed to run git command: {cmd}")
+
+def _retrieve_git_tag(source_path: str) -> str:
+    cmd = f"git -C {source_path} rev-list --tags --max-count=1"
+    hash = _run_git_command(cmd)
+    cmd = f"git -C {source_path} describe --tags {hash}"
+    tag = _run_git_command(cmd)
+    cmd = f"git -C {source_path} rev-list {tag}..HEAD --count"
+    count = _run_git_command(cmd)
+    return f"{tag}-{count}"
+
+# Parse the git version from the command line.  This code
+# is borrowed from Klipper.
+def retrieve_git_version(source_path: str) -> str:
+    # Obtain version info from "git" program
+    cmd = f"git -C {source_path} describe --always --tags --long --dirty"
+    ver = _run_git_command(cmd)
+    tag_match = re.match(r"v\d+\.\d+\.\d+", ver)
+    if tag_match is not None:
+        return ver
+    # This is likely a shallow clone.  Resolve the tag and manually create
+    # the version string
+    tag = _retrieve_git_tag(source_path)
+    return f"t{tag}-g{ver}-shallow"
 
 def get_software_version() -> str:
     version = "?"
 
     try:
-        version = retreive_git_version(MOONRAKER_PATH)
+        version = retrieve_git_version(MOONRAKER_PATH)
     except Exception:
         vfile = pathlib.Path(os.path.join(
             MOONRAKER_PATH, "moonraker/.version"))
@@ -109,7 +138,8 @@ def get_software_version() -> str:
 
 def setup_logging(app_args: Dict[str, Any]
                   ) -> Tuple[logging.handlers.QueueListener,
-                             Optional[MoonrakerLoggingHandler]]:
+                             Optional[MoonrakerLoggingHandler],
+                             Optional[str]]:
     root_logger = logging.getLogger()
     queue: Queue = Queue()
     queue_handler = LocalQueueHandler(queue)
@@ -121,20 +151,30 @@ def setup_logging(app_args: Dict[str, Any]
     stdout_hdlr.setFormatter(stdout_fmt)
     for name, val in app_args.items():
         logging.info(f"{name}: {val}")
-    file_hdlr = None
-    if app_args.get('log_file', ""):
-        file_hdlr = MoonrakerLoggingHandler(
-            app_args, when='midnight', backupCount=2)
-        formatter = logging.Formatter(
-            '%(asctime)s [%(filename)s:%(funcName)s()] - %(message)s')
-        file_hdlr.setFormatter(formatter)
-        listener = logging.handlers.QueueListener(
-            queue, file_hdlr, stdout_hdlr)
-    else:
+    warning: Optional[str] = None
+    file_hdlr: Optional[MoonrakerLoggingHandler] = None
+    listener: Optional[logging.handlers.QueueListener] = None
+    log_file: str = app_args.get('log_file', "")
+    if log_file:
+        try:
+            file_hdlr = MoonrakerLoggingHandler(
+                app_args, when='midnight', backupCount=2)
+            formatter = logging.Formatter(
+                '%(asctime)s [%(filename)s:%(funcName)s()] - %(message)s')
+            file_hdlr.setFormatter(formatter)
+            listener = logging.handlers.QueueListener(
+                queue, file_hdlr, stdout_hdlr)
+        except Exception:
+            log_file = os.path.normpath(log_file)
+            dir_name = os.path.dirname(log_file)
+            warning = f"Unable to create log file at '{log_file}'. " \
+                      f"Make sure that the folder '{dir_name}' exists " \
+                      f"and Moonraker has Read/Write access to the folder. "
+    if listener is None:
         listener = logging.handlers.QueueListener(
             queue, stdout_hdlr)
     listener.start()
-    return listener, file_hdlr
+    return listener, file_hdlr, warning
 
 def hash_directory(dir_path: str,
                    ignore_exts: List[str],
@@ -174,3 +214,19 @@ def verify_source(path: str = MOONRAKER_PATH) -> Optional[Tuple[str, bool]]:
     ign_exts = rinfo['ignored_exts']
     checksum = hash_directory(path, ign_exts, ign_dirs)
     return checksum, checksum == orig_chksum
+
+def load_system_module(name: str) -> ModuleType:
+    for module_path in SYS_MOD_PATHS:
+        sys.path.insert(0, module_path)
+        try:
+            module = importlib.import_module(name)
+        except ImportError as e:
+            if not isinstance(e, ModuleNotFoundError):
+                logging.exception(f"Failed to load {name} module")
+            sys.path.pop(0)
+        else:
+            sys.path.pop(0)
+            break
+    else:
+        raise ServerError(f"Unable to import module {name}")
+    return module
